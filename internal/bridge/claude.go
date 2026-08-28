@@ -300,8 +300,8 @@ func (b *Bridge) HandleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// HandleListModels 实现 GET /v1/models，返回 Claude API 格式的模型列表。
-// Claude Code 通过此接口获取 context_window 大小，用于决定何时触发 compact（80% 阈值）。
+// HandleListModels 实现 GET /v1/models，返回 OpenAI 兼容格式的模型列表。
+// Claude Code / OpenCode 等客户端通过此接口获取 context_window 大小。
 func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 	models, err := b.ListAvailableModels()
 	if err != nil {
@@ -321,31 +321,33 @@ func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 			maxOut = 32768
 		}
 		entry := map[string]interface{}{
-			"type":              "model",
 			"id":               m.Key,
+			"object":           "model",
+			"created":          1687864820,
+			"owned_by":         "qoder",
 			"display_name":     m.DisplayName,
-			"created_at":       "2024-01-01T00:00:00Z",
 			"context_window":   ctxWin,
 			"max_output_tokens": maxOut,
-		}
-		if m.IsReasoning {
-			entry["supports_thinking"] = true
+			"enable":          m.Enable,
+			"is_default":      m.IsDefault,
+			"is_reasoning":    m.IsReasoning,
+			"price_factor":    m.PriceFactor,
 		}
 		data = append(data, entry)
 	}
 	if len(data) == 0 {
-		// 兜底：返回 Qoder 已知的 assistant 模型列表
 		for _, key := range []string{"auto", "ultimate", "performance", "efficient", "lite"} {
 			data = append(data, map[string]interface{}{
-				"type":           "model",
 				"id":             key,
+				"object":         "model",
+				"created":        1687864820,
+				"owned_by":       "qoder",
 				"display_name":   key,
-				"created_at":     "2024-01-01T00:00:00Z",
 				"context_window": fallbackContextWindow,
 			})
 		}
 	}
-	WriteJSON(w, map[string]interface{}{"data": data})
+	WriteJSON(w, map[string]interface{}{"object": "list", "data": data})
 }
 
 func WriteClaudeErr(w http.ResponseWriter, err error) {

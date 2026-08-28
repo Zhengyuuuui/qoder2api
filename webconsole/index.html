@@ -238,7 +238,7 @@
     <section class="card grid-2">
       <div>
         <h3>模型</h3>
-        <pre id="modelsBox">加载中...</pre>
+        <div id="modelsBox">加载中...</div>
       </div>
       <div>
         <h3>最近日志</h3>
@@ -369,6 +369,38 @@
       }
     }
 
+    function renderModelsTable(models) {
+      if (!models || !models.length) {
+        return '<div class="muted">暂无模型</div>';
+      }
+      const rows = models.map(m => {
+        const ctx = m.context_window != null ? Number(m.context_window).toLocaleString() : '-';
+        const maxOut = m.max_output_tokens != null ? Number(m.max_output_tokens).toLocaleString() : '-';
+        const name = m.display_name || m.id;
+        return `<tr>
+          <td>${name}</td>
+          <td>${m.id || '-'}</td>
+          <td>${ctx}</td>
+          <td>${maxOut}</td>
+          <td>${m.is_reasoning ? '✅' : ''}</td>
+          <td>${m.enable === false ? '❌' : '✅'}</td>
+        </tr>`;
+      }).join('');
+      return `<table>
+        <thead>
+          <tr>
+            <th>模型</th>
+            <th>Key</th>
+            <th>上下文</th>
+            <th>最大输出</th>
+            <th>推理</th>
+            <th>启用</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    }
+
     function fmtNum(n) {
       if (n == null || Number.isNaN(n)) return '-';
       return Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 });
@@ -488,8 +520,9 @@
       }
 
       try {
-        const models = await api('/api/models');
-        $('modelsBox').textContent = JSON.stringify(models, null, 2);
+        const res = await api('/api/models');
+        const models = (res && res.data) || [];
+        $('modelsBox').innerHTML = renderModelsTable(models);
       } catch (e) {
         $('modelsBox').textContent = e.message;
       }
