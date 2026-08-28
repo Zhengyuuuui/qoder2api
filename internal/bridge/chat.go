@@ -18,7 +18,7 @@ func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(405)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		WriteErr(w, err)
 		return
@@ -84,6 +84,7 @@ func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			if flusher != nil {
 				flusher.Flush()
 			}
+			return
 		}
 		finishReason := "stop"
 		if len(toolCallBuf) > 0 {

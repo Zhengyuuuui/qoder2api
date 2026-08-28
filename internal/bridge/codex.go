@@ -18,7 +18,7 @@ func (b *Bridge) HandleCodexResponses(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(405)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		WriteCodexErr(w, err)
 		return
@@ -116,6 +116,7 @@ func (b *Bridge) HandleCodexResponses(w http.ResponseWriter, r *http.Request) {
 				"type":    "error",
 				"message": err.Error(),
 			})
+			return
 		}
 
 		writeEvent("response.output_text.done", map[string]interface{}{

@@ -50,7 +50,7 @@ func (c *BearerClient) buildHeaders(pathSig, body, accept string, extra map[stri
 		"login-version":         "v2",
 		"user-agent":            "Go-http-client/2.0",
 		"cosy-scene":            "assistant",
-		"cosy-business-product": "cli",
+		"cosy-business-product":      "ide",
 		"cosy-business-type":    "agent",
 	}
 	for k, v := range extra {
@@ -197,19 +197,36 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 		return fmt.Errorf("HTTP %d %s", resp.StatusCode, string(body))
 	}
 
-	// 增大 Scanner 缓冲区到 1MB，避免单行超过 64KB 默认限制导致 token too long 断流
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line != "" {
-			onLine(line)
+	lineCh := make(chan string)
+	errCh := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+		for scanner.Scan() {
+			select {
+			case lineCh <- scanner.Text():
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-errCh:
+			logger.Debug("stream read complete")
+			return err
+		case line := <-lineCh:
+			if line != "" {
+				onLine(line)
+			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		logger.Error("stream scanner error: %v", err)
-		return err
-	}
-	logger.Debug("stream read complete")
-	return nil
 }
