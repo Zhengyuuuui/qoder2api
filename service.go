@@ -15,11 +15,13 @@ import (
 )
 
 type QoderModel struct {
-	Key            string  `json:"key"`
+	Key            string  `json:"id"`
 	DisplayName    string  `json:"display_name"`
 	Enable         bool    `json:"enable"`
 	IsDefault      bool    `json:"is_default"`
 	IsReasoning    bool    `json:"is_reasoning,omitempty"`
+	ContextWindow  int     `json:"context_window,omitempty"`
+	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
 	MaxInputTokens int     `json:"max_input_tokens,omitempty"`
 	PriceFactor    float64 `json:"price_factor,omitempty"`
 }
@@ -310,6 +312,8 @@ func (s *Service) ListQoderModels() ([]QoderModel, error) {
 			IsReasoning:    m.IsReasoning,
 			MaxInputTokens: m.MaxInputTokens,
 			PriceFactor:    m.PriceFactor,
+			ContextWindow:  m.ContextWindow,
+			MaxOutputTokens: m.MaxOutputTokens,
 		}
 	}
 	return out, nil

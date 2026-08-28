@@ -312,7 +312,10 @@ func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 	const defaultMaxOutputTokens = 16384
 	data := make([]interface{}, 0, len(models))
 	for _, m := range models {
-		ctxWin := m.MaxInputTokens
+		ctxWin := m.ContextWindow
+		if ctxWin == 0 {
+			ctxWin = m.MaxInputTokens
+		}
 		if ctxWin == 0 {
 			ctxWin = fallbackContextWindow
 		}

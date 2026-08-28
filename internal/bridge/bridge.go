@@ -83,6 +83,8 @@ type QoderModel struct {
 	Enable         bool    `json:"enable"`
 	IsDefault      bool    `json:"is_default"`
 	IsReasoning    bool    `json:"is_reasoning,omitempty"`
+	ContextWindow  int     `json:"context_window,omitempty"`
+	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
 	MaxInputTokens int     `json:"max_input_tokens,omitempty"`
 	PriceFactor    float64 `json:"price_factor,omitempty"`
 }
@@ -193,7 +195,7 @@ func extractModels(rawList []interface{}) []QoderModel {
 			continue
 		}
 		enable, _ := m["enable"].(bool)
-		out = append(out, QoderModel{
+		model := QoderModel{
 			Key:            StrVal(m, "key"),
 			DisplayName:    StrVal(m, "display_name"),
 			Enable:         enable,
@@ -201,7 +203,45 @@ func extractModels(rawList []interface{}) []QoderModel {
 			IsReasoning:    func() bool { v, _ := m["is_reasoning"].(bool); return v }(),
 			MaxInputTokens: int(cosy.FloatVal(m, "max_input_tokens")),
 			PriceFactor:    cosy.FloatVal(m, "price_factor"),
-		})
+		}
+		if cc, ok := m["context_config"].(map[string]interface{}); ok {
+			var defaultCfg map[string]interface{}
+			for _, cfg := range cc {
+				cfgMap, _ := cfg.(map[string]interface{})
+				if cfgMap == nil {
+					continue
+				}
+				isDefault, _ := cfgMap["is_default"].(bool)
+				if isDefault {
+					defaultCfg = cfgMap
+					break
+				}
+			}
+			if defaultCfg == nil {
+				for _, cfg := range cc {
+					cfgMap, _ := cfg.(map[string]interface{})
+					if cfgMap != nil {
+						defaultCfg = cfgMap
+						break
+					}
+				}
+			}
+			if defaultCfg != nil {
+				model.ContextWindow = int(cosy.FloatVal(defaultCfg, "token_count"))
+			}
+		}
+		if model.ContextWindow == 0 {
+			model.ContextWindow = model.MaxInputTokens
+		}
+		if model.ContextWindow == 0 {
+			model.ContextWindow = model.MaxInputTokens
+		}
+		if model.IsReasoning {
+			model.MaxOutputTokens = 32768
+		} else {
+			model.MaxOutputTokens = 16384
+		}
+		out = append(out, model)
 	}
 	return out
 }

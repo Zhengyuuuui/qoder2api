@@ -374,12 +374,13 @@
         return '<div class="muted">暂无模型</div>';
       }
       const rows = models.map(m => {
-        const ctx = m.context_window != null ? Number(m.context_window).toLocaleString() : '-';
+        const ctx = (m.max_input_tokens || m.context_window) != null ? Number(m.max_input_tokens || m.context_window).toLocaleString() : '-';
         const maxOut = m.max_output_tokens != null ? Number(m.max_output_tokens).toLocaleString() : '-';
-        const name = m.display_name || m.id;
+        const name = m.display_name || m.id || m.key || '-';
+        const key = m.id || m.key || '-';
         return `<tr>
           <td>${name}</td>
-          <td>${m.id || '-'}</td>
+          <td>${key}</td>
           <td>${ctx}</td>
           <td>${maxOut}</td>
           <td>${m.is_reasoning ? '✅' : ''}</td>
