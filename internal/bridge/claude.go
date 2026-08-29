@@ -18,7 +18,7 @@ func (b *Bridge) HandleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(405)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		WriteClaudeErr(w, err)
 		return

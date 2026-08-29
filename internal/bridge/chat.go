@@ -18,7 +18,7 @@ func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(405)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		WriteErr(w, err)
 		return
@@ -59,6 +59,10 @@ func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		var totalInputTokens, totalOutputTokens int
 
 		err = b.CallQoder(ctx, InferAgent(model), messages, model, tools, func(d Delta) {
+			if d.Err != nil {
+				logger.Error("[Chat][%s] upstream error in stream callback: %v", reqID, d.Err)
+				return
+			}
 			if d.InputTokens > 0 || d.OutputTokens > 0 {
 				totalInputTokens = d.InputTokens
 				totalOutputTokens = d.OutputTokens
@@ -74,7 +78,11 @@ func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				delta["tool_calls"] = d.ToolCalls
 				toolCallBuf = append(toolCallBuf, d.ToolCalls...)
 			}
-			data, _ := json.Marshal(chunk)
+			data, err := json.Marshal(chunk)
+			if err != nil {
+				logger.Error("[Chat][%s] marshal chunk failed: %v", reqID, err)
+				return
+			}
 			fmt.Fprintf(w, "data: %s\n\n", string(data))
 			if flusher != nil {
 				flusher.Flush()
