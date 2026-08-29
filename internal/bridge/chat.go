@@ -56,8 +56,13 @@ func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		flusher, _ := w.(http.Flusher)
 
 		var toolCallBuf []interface{}
+		var totalInputTokens, totalOutputTokens int
 
 		err = b.CallQoder(ctx, InferAgent(model), messages, model, tools, func(d Delta) {
+			if d.InputTokens > 0 || d.OutputTokens > 0 {
+				totalInputTokens = d.InputTokens
+				totalOutputTokens = d.OutputTokens
+			}
 			chunk := MakeChatChunk(reqId, created, model)
 			choices := chunk["choices"].([]interface{})
 			delta := choices[0].(map[string]interface{})["delta"].(map[string]interface{})
@@ -95,6 +100,13 @@ func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ch := choices[0].(map[string]interface{})
 		ch["finish_reason"] = finishReason
 		ch["delta"] = map[string]interface{}{}
+		if totalInputTokens > 0 || totalOutputTokens > 0 {
+			done["usage"] = map[string]interface{}{
+				"prompt_tokens": totalInputTokens,
+				"completion_tokens": totalOutputTokens,
+				"total_tokens": totalInputTokens + totalOutputTokens,
+			}
+		}
 		data, _ := json.Marshal(done)
 		fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", string(data))
 		if flusher != nil {

@@ -38,6 +38,14 @@ func ExtractDelta(dataLine string) Delta {
 		logger.Debug("[delta] unmarshal inner failed: %v", err)
 		return Delta{}
 	}
+	// 先检查顶层 usage（上游可能在最后一个 chunk 中与 choices 一起返回）
+	if usage, ok := innerJSON["usage"].(map[string]interface{}); ok {
+		in := int(cosy.FloatVal(usage, "prompt_tokens"))
+		out := int(cosy.FloatVal(usage, "completion_tokens"))
+		if in > 0 || out > 0 {
+			return Delta{InputTokens: in, OutputTokens: out}
+		}
+	}
 	choices, _ := innerJSON["choices"].([]interface{})
 	for _, ch := range choices {
 		chMap, _ := ch.(map[string]interface{})
@@ -54,14 +62,6 @@ func ExtractDelta(dataLine string) Delta {
 		}
 		if role != "" || content != "" || reasoning != "" || toolCalls != nil {
 			return Delta{Role: role, Content: content, Reasoning: reasoning, ToolCalls: toolCalls}
-		}
-	}
-	// 上游最后一个 chunk 通常 choices 为空，但顶层携带 usage 统计
-	if usage, ok := innerJSON["usage"].(map[string]interface{}); ok {
-		in := int(cosy.FloatVal(usage, "prompt_tokens"))
-		out := int(cosy.FloatVal(usage, "completion_tokens"))
-		if in > 0 || out > 0 {
-			return Delta{InputTokens: in, OutputTokens: out}
 		}
 	}
 	// 上游业务错误：{"code":"115","message":"..."}
