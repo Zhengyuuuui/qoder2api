@@ -50,7 +50,7 @@ func (c *BearerClient) buildHeaders(pathSig, body, accept string, extra map[stri
 		"login-version":         "v2",
 		"user-agent":            "Go-http-client/2.0",
 		"cosy-scene":            "assistant",
-		"cosy-business-product":      "ide",
+		"cosy-business-product":      "cli",
 		"cosy-business-type":    "agent",
 	}
 	for k, v := range extra {
