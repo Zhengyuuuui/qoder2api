@@ -265,7 +265,7 @@ func (b *Bridge) CallQoder(ctx context.Context, agent string, messages []interfa
 }
 
 func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) error {
-	// 将客户端模型名（claude-sonnet-4-6 等）映射成 Qoder 上游内部 model.key（auto/ultimate/performance/lite/efficient）。
+	// 将客户端模型名（claude-sonnet-4-6 等）映射成 Qoder 上游内部 model.key（auto/qmodel_38max/gmodel/dmodel 等）。
 	// 上游对未知 key 会走兜底返回内容，但不会把这次调用计入 quota，这是「请求成功但 dashboard 无用量」的根因。
 	originalModel := model
 	model = MapModel(agent, model)
@@ -477,17 +477,17 @@ func InferAgent(model string) string {
 // 一条 "sonnet" 即可覆盖 claude-sonnet-4-6 / claude-sonnet-4-20250514 等所有变体。
 //
 // 设计原则：默认表只负责让请求落到合法 SKU 不出错，差异化由用户在 UI 自行覆盖。
-// Qoder 上游合法 key 仅 auto/ultimate/performance/lite/efficient（见 cmd/fetchmodels/models_result.json），
+// Qoder 上游合法 key 见 /v1/models 返回，随上游变化动态调整。
 // GPT / Gemini 没有专属 SKU，统一映射到主力档 performance —— 既不浪费 ultimate 高 price_factor，
 // 也不被 lite 限频；想分档（如 gpt-5→ultimate / gpt-5-mini→efficient）请在 UI 配置。
 var defaultModelMapping = map[string]string{
 	// Claude 三档
-	"opus":   "ultimate",
-	"sonnet": "performance",
-	"haiku":  "lite",
+	"opus":   "qmodel_38max",
+	"sonnet": "gmodel",
+	"haiku":  "qfmodel",
 	// 非 Claude 家族兜底
-	"gpt":    "performance",
-	"gemini": "performance",
+	"gpt":    "dmodel",
+	"gemini": "gmodel",
 }
 
 // MapModel 解析顺序（参考 ccx 的 RedirectModel 算法）：

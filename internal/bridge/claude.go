@@ -34,7 +34,7 @@ func (b *Bridge) HandleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stream, _ := req["stream"].(bool)
-	model := StrValDefault(req, "model", "lite")
+	model := StrValDefault(req, "model", "auto")
 	incomingMsgs, _ := req["messages"].([]interface{})
 
 	// Claude format: tools use name+input_schema directly
@@ -339,7 +339,7 @@ func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 		data = append(data, entry)
 	}
 	if len(data) == 0 {
-		for _, key := range []string{"auto", "ultimate", "performance", "efficient", "lite"} {
+		for _, key := range []string{"auto", "qmodel_38max", "qfmodel", "qmodel_latest", "qmodel", "q37fmodel", "dmodel", "dfmodel", "gmodel", "gfmodel", "gm51model", "kmodel_latest", "kmodel", "mmodel"} {
 			data = append(data, map[string]interface{}{
 				"id":             key,
 				"object":         "model",

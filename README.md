@@ -159,7 +159,7 @@ curl http://127.0.0.1:8963/v1/models
    - 类型：`OpenAI`
    - Base URL：`http://<host>:8963/v1`
    - Key：控制台中的密钥  
-3. 模型填 Qoder 侧 ID，例如：`auto`、`ultimate`、`qmodel_latest`、`kmodel_latest` 等  
+3. 模型填 Qoder 侧 ID，例如：`auto`、`qmodel_38max`、`qfmodel`、`gmodel`、`dmodel`、`kmodel_latest` 等  
 
 ### 接入 OpenCode
 

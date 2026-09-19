@@ -34,7 +34,7 @@ func (b *Bridge) HandleCodexResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stream, _ := req["stream"].(bool)
-	model := StrValDefault(req, "model", "lite")
+	model := StrValDefault(req, "model", "auto")
 	instructions, _ := req["instructions"].(string)
 	tools := req["tools"]
 	toolsEnabled := tools != nil

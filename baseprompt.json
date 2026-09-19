@@ -10,7 +10,7 @@
       "context": [],
       "modelConfig": {
         "is_reasoning": false,
-        "key": "lite"
+        "key": "auto"
       },
       "originalContent": {
         "type": "text",
@@ -40,8 +40,8 @@
   "agent_id": "agent_common",
   "task_id": "common",
   "model_config": {
-    "key": "lite",
-    "display_name": "Lite",
+    "key": "auto",
+    "display_name": "Auto",
     "model": "",
     "format": "openai",
     "is_vl": false,
