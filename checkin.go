@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -24,6 +27,12 @@ type CheckinResult struct {
 	Amount    int    `json:"amount,omitempty"`
 	ExpiresAt string `json:"expires_at,omitempty"`
 	Message   string `json:"message"`
+
+	// 签到统计（来自 daily-check-in/status）
+	StreakDays         int `json:"streak_days,omitempty"`          // 连续签到天数
+	TotalClaimDays     int `json:"total_claim_days,omitempty"`     // 累计签到天数
+	TotalRewardCredits int `json:"total_reward_credits,omitempty"` // 累计奖励积分
+	RewardCredits      int `json:"reward_credits,omitempty"`       // 每日签到奖励额
 }
 
 const (
@@ -54,12 +63,15 @@ func checkinHeaders(deviceToken string) map[string]string {
 }
 
 // doCheckinRequest 发送签到相关请求，返回 (httpStatus, parsedJSON, rawBody)
-func doCheckinRequest(method, path, deviceToken string) (int, interface{}, string) {
+// reqBody 为 nil 时发送空 body（抓包确认 campaigns/claim 即为空 body）
+func doCheckinRequest(method, path, deviceToken string, reqBody interface{}) (int, interface{}, string) {
 	url := "https://" + checkinHost + path
 
 	var body io.Reader
-	if method == "POST" {
-		body = nil // 抓包确认 claim 请求体为空
+	var bodyBytes []byte
+	if reqBody != nil {
+		bodyBytes, _ = json.Marshal(reqBody)
+		body = bytes.NewReader(bodyBytes)
 	}
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
@@ -70,7 +82,9 @@ func doCheckinRequest(method, path, deviceToken string) (int, interface{}, strin
 	}
 	if method == "POST" {
 		req.Header.Set("origin", "https://"+checkinHost)
-		req.ContentLength = 0
+		if reqBody == nil {
+			req.ContentLength = 0 // 抓包确认 claim 无 body
+		}
 	}
 
 	resp, err := checkinClient.Do(req)
@@ -117,7 +131,137 @@ type claimResponse struct {
 	ExpiresAt string `json:"expiresAt"`
 }
 
+// dailyCheckinStatus GET /sash/api/v1/me/daily-check-in/status 响应
+type dailyCheckinStatus struct {
+	CampaignKey        string `json:"campaignKey"` // 例: cn_daily_check_in_legacy
+	Status             string `json:"status"`      // CLAIMABLE | CLAIMED | DISABLED
+	RewardCredits      int    `json:"rewardCredits"`
+	CurrentStreakDays  int    `json:"currentStreakDays"`
+	TotalClaimDays     int    `json:"totalClaimDays"`
+	TotalRewardCredits int    `json:"totalRewardCredits"`
+}
+
+// ---------- 本地签到历史（计算连续天数） ----------
+// 上游 daily-check-in legacy 系统已全局 DISABLED（streak 恒为 0），
+// 因此由 qoder2api 本地记录签到日期，计算真实连续签到天数。
+// 数据存于 <DataRoot>/checkin_history.json
+
+type checkinRecord struct {
+	Date   string `json:"date"`   // YYYY-MM-DD
+	Amount int    `json:"amount"` // 当次领取积分
+}
+
+type checkinHistory struct {
+	Accounts map[string][]checkinRecord `json:"accounts"`
+}
+
+var historyMu sync.Mutex
+
+func checkinHistoryPath() string {
+	return filepath.Join(account.DataRoot(), "checkin_history.json")
+}
+
+func loadCheckinHistory() *checkinHistory {
+	h := &checkinHistory{Accounts: map[string][]checkinRecord{}}
+	data, err := os.ReadFile(checkinHistoryPath())
+	if err != nil {
+		return h
+	}
+	_ = json.Unmarshal(data, h)
+	if h.Accounts == nil {
+		h.Accounts = map[string][]checkinRecord{}
+	}
+	return h
+}
+
+func saveCheckinHistory(h *checkinHistory) {
+	data, _ := json.MarshalIndent(h, "", "  ")
+	_ = os.WriteFile(checkinHistoryPath(), data, 0600)
+}
+
+// calcLocalStats 计算连续天数与累计
+// streak：今天已领从今天起数；今天未领则从昨天起数（当天未领不断链）
+func calcLocalStats(recs []checkinRecord) (streak, totalDays, totalCredits int) {
+	if len(recs) == 0 {
+		return 0, 0, 0
+	}
+	days := map[string]bool{}
+	for _, r := range recs {
+		days[r.Date] = true
+		totalCredits += r.Amount
+	}
+	totalDays = len(recs)
+
+	cursor := time.Now()
+	if !days[cursor.Format("2006-01-02")] {
+		cursor = cursor.AddDate(0, 0, -1)
+	}
+	for days[cursor.Format("2006-01-02")] {
+		streak++
+		cursor = cursor.AddDate(0, 0, -1)
+	}
+	return streak, totalDays, totalCredits
+}
+
+// recordCheckinToday 记录该账号今日签到（同日幂等），返回本地统计
+func recordCheckinToday(accountID string, amount int) (streak, totalDays, totalCredits int) {
+	historyMu.Lock()
+	defer historyMu.Unlock()
+
+	h := loadCheckinHistory()
+	recs := h.Accounts[accountID]
+	today := time.Now().Format("2006-01-02")
+
+	found := false
+	for _, r := range recs {
+		if r.Date == today {
+			found = true
+			break
+		}
+	}
+	if !found {
+		recs = append(recs, checkinRecord{Date: today, Amount: amount})
+		h.Accounts[accountID] = recs
+		saveCheckinHistory(h)
+	} else if amount > 0 {
+		// 今日已有记录但金额为 0（早前版本记录）→ 补记金额
+		for i := range recs {
+			if recs[i].Date == today && recs[i].Amount == 0 {
+				recs[i].Amount = amount
+				h.Accounts[accountID] = recs
+				saveCheckinHistory(h)
+				break
+			}
+		}
+	}
+	return calcLocalStats(recs)
+}
+
+// localCheckinStats 只读获取本地统计（不记录）
+func localCheckinStats(accountID string) (streak, totalDays, totalCredits int) {
+	historyMu.Lock()
+	defer historyMu.Unlock()
+	return calcLocalStats(loadCheckinHistory().Accounts[accountID])
+}
+
+// applyLocalStreak 用本地签到历史覆盖统计字段（本地数据比上游 legacy 更可信）
+func applyLocalStreak(accountID string, res *CheckinResult, recordToday bool, amount int) {
+	var streak, totalDays, totalCredits int
+	if recordToday {
+		streak, totalDays, totalCredits = recordCheckinToday(accountID, amount)
+	} else {
+		streak, totalDays, totalCredits = localCheckinStats(accountID)
+	}
+	// 本地有记录 → 以本地为准；本地无记录 → 保留上游读到的值
+	if totalDays > 0 {
+		res.StreakDays = streak
+		res.TotalClaimDays = totalDays
+		res.TotalRewardCredits = totalCredits
+	}
+}
+
 // checkinAccount 对单个账号执行签到
+// 优先走 daily-check-in 简化端点（带连续签到统计），不可用时回退 campaigns 流程
 func checkinAccount(acct *account.Account) CheckinResult {
 	res := CheckinResult{
 		Account:   acct.Name,
@@ -149,17 +293,142 @@ func checkinAccount(acct *account.Account) CheckinResult {
 		return res
 	}
 
+	// ========== 主流程：daily-check-in 简化端点 ==========
+	if r, ok := tryDailyCheckin(deviceToken, &res); ok {
+		return finalizeCheckin(acct.ID, r)
+	}
+
+	// ========== 兜底：campaigns 流程 ==========
+	return finalizeCheckin(acct.ID, campaignsCheckin(deviceToken, &res))
+}
+
+// finalizeCheckin 收尾：写入/读取本地签到历史并把统计拼进消息
+// 领取成功或已领取 → 记录今日；其他状态只读统计
+func finalizeCheckin(accountID string, r CheckinResult) CheckinResult {
+	record := r.Status == checkinStatusClaimed || r.Status == checkinStatusAlreadyClaimed
+
+	// 领取金额：响应值 → status 接口的 rewardCredits → 活动默认 100
+	amount := r.Amount
+	if amount == 0 {
+		amount = r.RewardCredits
+	}
+	if amount == 0 {
+		amount = 100
+	}
+
+	applyLocalStreak(accountID, &r, record, amount)
+	// 领取类结果统一追加统计后缀（applyLocalStreak 已更新统计）
+	if record || r.StreakDays > 0 || r.TotalClaimDays > 0 {
+		r.Message = r.Message + streakSuffix(&r, "")
+	}
+	return r
+}
+
+// tryDailyCheckin 尝试 daily-check-in 简化端点；返回 (result, handled)
+// 流程：GET status 拿连续签到统计 → POST claim 幂等领取（409=今日已领）
+// 端点不可用/异常时返回 handled=false，由调用方回退到 campaigns 流程
+func tryDailyCheckin(deviceToken string, res *CheckinResult) (CheckinResult, bool) {
+	// Step 1: 查询签到状态（拿连续天数统计）
+	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/daily-check-in/status", deviceToken, nil)
+
+	// 404/501 = 端点不存在 → 回退
+	if status == 404 || status == 501 {
+		logger.Info("[Checkin] daily-check-in/status not available (HTTP %d), fallback to campaigns", status)
+		return *res, false
+	}
+	if status == 401 {
+		res.Message = fmt.Sprintf("token 无效: %s", truncate(raw, 200))
+		return *res, true
+	}
+	if status != 200 {
+		logger.Info("[Checkin] daily-check-in/status HTTP %d, fallback: %s", status, truncate(raw, 200))
+		return *res, false
+	}
+
+	// 解析状态与统计
+	var st dailyCheckinStatus
+	b, _ := json.Marshal(body)
+	if json.Unmarshal(b, &st) != nil || st.Status == "" {
+		logger.Info("[Checkin] daily-check-in/status bad body, fallback: %s", truncate(raw, 200))
+		return *res, false
+	}
+
+	// 无论后续领取结果如何，先保存统计字段
+	res.StreakDays = st.CurrentStreakDays
+	res.TotalClaimDays = st.TotalClaimDays
+	res.TotalRewardCredits = st.TotalRewardCredits
+	res.RewardCredits = st.RewardCredits
+	logger.Info("[Checkin] daily-check-in status=%s key=%s streak=%d totalDays=%d",
+		st.Status, st.CampaignKey, st.CurrentStreakDays, st.TotalClaimDays)
+
+	// Step 2: 幂等领取（status=CLAIMED 时也直接 claim，靠 409 判定已领）
+	status, body, raw = doCheckinRequest("POST", "/sash/api/v1/me/daily-check-in/claim", deviceToken, map[string]interface{}{})
+
+	// 409 AlreadyExists = 今日已领取（与 campaigns 领取状态共享）
+	if status == 409 {
+			res.Status = checkinStatusAlreadyClaimed
+			res.Message = "今日已领取"
+		return *res, true
+	}
+
+	// 领取成功
+	if status == 200 {
+		var claimResp struct {
+			Success       bool `json:"success"`
+			RewardCredits int  `json:"rewardCredits"`
+		}
+		b, _ = json.Marshal(body)
+		_ = json.Unmarshal(b, &claimResp)
+
+		res.Status = checkinStatusClaimed
+		amount := claimResp.RewardCredits
+		if amount == 0 {
+			amount = res.RewardCredits
+		}
+		if amount == 0 {
+			amount = 100 // 活动默认 100
+		}
+		res.Amount = amount
+		res.StreakDays++
+		res.TotalClaimDays++
+		res.TotalRewardCredits += amount
+		res.Message = fmt.Sprintf("签到成功 +%d", amount)
+		return *res, true
+	}
+
+	// 其他错误（如 legacy DISABLED 拒绝）→ 回退 campaigns（统计字段已保留在 res 上）
+	logger.Info("[Checkin] daily-check-in/claim HTTP %d, fallback to campaigns: %s", status, truncate(raw, 200))
+	return *res, false
+}
+
+// streakSuffix 在消息后追加连续签到统计（无统计时不追加）
+func streakSuffix(res *CheckinResult, prefix string) string {
+	if res.StreakDays <= 0 && res.TotalClaimDays <= 0 {
+		if prefix != "" {
+			return prefix
+		}
+		return ""
+	}
+	s := fmt.Sprintf("（连续 %d 天 · 累计 %d 天 · 共 %d 积分）", res.StreakDays, res.TotalClaimDays, res.TotalRewardCredits)
+	if prefix != "" {
+		return prefix + s
+	}
+	return s
+}
+
+// campaignsCheckin 兜底：走桌面端抓包还原的 campaigns 流程
+func campaignsCheckin(deviceToken string, res *CheckinResult) CheckinResult {
 	// Step 1: 查询活动列表
-	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/campaigns", deviceToken)
+	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/campaigns", deviceToken, nil)
 	if status != 200 {
 		res.Message = fmt.Sprintf("查询活动失败 HTTP %d: %s", status, truncate(raw, 300))
-		return res
+		return *res
 	}
 
 	list, ok := body.(map[string]interface{})
 	if !ok {
 		res.Message = fmt.Sprintf("活动列表格式异常: %s", truncate(raw, 300))
-		return res
+		return *res
 	}
 
 	// 解析 campaigns
@@ -191,27 +460,27 @@ func checkinAccount(acct *account.Account) CheckinResult {
 	if target == nil {
 		if alreadyClaimed {
 			res.Status = checkinStatusAlreadyClaimed
-			res.Message = "今日已领取"
+		res.Message = "今日已领取"
 		} else {
 			res.Status = checkinStatusNoCampaign
 			res.Message = "无可用签到活动"
 		}
-		return res
+		return *res
 	}
 
-	// Step 2: 领取
+	// Step 2: 领取（空 body，抓包确认）
 	claimPath := fmt.Sprintf("/sash/api/v1/me/campaigns/%s/claim", target.CampaignID)
-	status, body, raw = doCheckinRequest("POST", claimPath, deviceToken)
+	status, body, raw = doCheckinRequest("POST", claimPath, deviceToken, nil)
 	if status != 200 {
 		res.Message = fmt.Sprintf("领取失败 HTTP %d: %s", status, truncate(raw, 300))
-		return res
+		return *res
 	}
 
 	var cr claimResponse
 	b, _ := json.Marshal(body)
 	if json.Unmarshal(b, &cr) != nil {
 		res.Message = fmt.Sprintf("领取响应格式异常: %s", truncate(raw, 300))
-		return res
+		return *res
 	}
 
 	if cr.Status == "CLAIMED" {
@@ -220,17 +489,17 @@ func checkinAccount(acct *account.Account) CheckinResult {
 			res.Message = "今日已领取（幂等返回）"
 		} else {
 			res.Status = checkinStatusClaimed
-			res.Message = fmt.Sprintf("领取成功 %s", target.CampaignKey)
 			if cr.Benefit != nil {
 				res.Amount = cr.Benefit.Amount
 			}
 			res.ExpiresAt = cr.ExpiresAt
+			res.Message = fmt.Sprintf("领取成功 +%d %s", res.Amount, target.CampaignKey)
 		}
-		return res
+		return *res
 	}
 
 	res.Message = fmt.Sprintf("未知状态: %s", cr.Status)
-	return res
+	return *res
 }
 
 // CheckinAll 对所有有 secret 的账号执行签到

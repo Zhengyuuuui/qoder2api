@@ -595,8 +595,14 @@
         if (summary.error) parts.push(`失败 ${summary.error} 个`);
         $('checkinMsg').className = summary.error ? 'msg err' : 'msg ok';
         $('checkinMsg').textContent = parts.join('，') || '完成';
+        // 展示连续签到统计
+        const lines = (res.results || []).map(r => {
+          let line = `${r.account}: ${r.message}`;
+          if (r.streak_days) line += `（🔥连续${r.streak_days}天 · 累计${r.total_claim_days}天 · 共${r.total_reward_credits}分）`;
+          return line;
+        });
         $('checkinResult').style.display = 'block';
-        $('checkinBox').textContent = JSON.stringify(res.results, null, 2);
+        $('checkinBox').textContent = lines.join('\n') || JSON.stringify(res.results, null, 2);
       } catch (e) {
         $('checkinMsg').className = 'msg err';
         $('checkinMsg').textContent = e.message;
@@ -813,7 +819,9 @@
               no_token: '无 token',
               error: r.message || '失败',
             };
-            alert(`${r.account || ''}: ${msgs[r.status] || r.message || r.status}`);
+            let detail = msgs[r.status] || r.message || r.status;
+            if (r.streak_days) detail += `\n🔥 连续 ${r.streak_days} 天 · 累计 ${r.total_claim_days} 天 · 共 ${r.total_reward_credits} 积分`;
+            alert(`${r.account || ''}\n${detail}`);
             if (r.status === 'claimed') await loadQuota(id);
           } catch (e) {
             alert(e.message);
