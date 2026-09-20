@@ -220,6 +220,17 @@
 
     <section class="card">
       <h3>账号列表 / 额度</h3>
+      <div class="row" style="margin-bottom:12px">
+        <button id="checkinBtn">🎁 每日签到领 100 Credits</button>
+        <label class="pill" style="cursor:pointer; margin-bottom:0">
+          <input type="checkbox" id="autoCheckinToggle" style="width:auto; margin-right:6px">
+          每日 10:00 自动签到
+        </label>
+        <span class="msg" id="checkinMsg"></span>
+      </div>
+      <div id="checkinResult" style="margin-bottom:12px; display:none">
+        <pre id="checkinBox"></pre>
+      </div>
       <table>
         <thead>
           <tr>
@@ -362,12 +373,36 @@
       try {
         const data = await api('/api/settings');
         fillConnection(data.connection || {}, data.settings || {});
+        // 同步自动签到开关
+        const st = data.settings || {};
+        if (document.activeElement !== $('autoCheckinToggle')) {
+          $('autoCheckinToggle').checked = !!st.auto_checkin;
+        }
       } catch (e) {
         fillConnection({}, {});
         $('connMsg').className = 'msg err';
         $('connMsg').textContent = e.message;
       }
     }
+
+    // 自动签到开关变更
+    $('autoCheckinToggle').onchange = async (ev) => {
+      const enabled = ev.target.checked;
+      $('checkinMsg').className = 'msg';
+      $('checkinMsg').textContent = '保存中...';
+      try {
+        await api('/api/settings/save', {
+          method: 'POST',
+          body: JSON.stringify({ auto_checkin: enabled }),
+        });
+        $('checkinMsg').className = 'msg ok';
+        $('checkinMsg').textContent = enabled ? '✅ 自动签到已开启（每日 10:00）' : '自动签到已关闭';
+      } catch (e) {
+        ev.target.checked = !enabled;
+        $('checkinMsg').className = 'msg err';
+        $('checkinMsg').textContent = e.message;
+      }
+    };
 
     function renderModelsTable(models) {
       if (!models || !models.length) {
@@ -484,6 +519,7 @@
           <td class="row">
             <button class="secondary" data-act="activate" data-id="${a.id}" ${a.active ? 'disabled' : ''}>激活</button>
             <button class="secondary" data-act="quota" data-id="${a.id}">刷新额度</button>
+            <button class="secondary" data-act="checkin" data-id="${a.id}">🎁 签到</button>
             <button class="danger" data-act="delete" data-id="${a.id}">删除</button>
           </td>
         </tr>
@@ -543,6 +579,31 @@
     }).catch(() => location.replace('/login.html'));
 
     $('refreshBtn').onclick = refresh;
+    $('checkinBtn').onclick = async () => {
+      $('checkinBtn').disabled = true;
+      $('checkinMsg').className = 'msg';
+      $('checkinMsg').textContent = '签到中...';
+      $('checkinResult').style.display = 'none';
+      try {
+        const res = await api('/api/checkin', { method: 'POST', body: '{}' });
+        const summary = res.summary || {};
+        const parts = [];
+        if (summary.claimed) parts.push(`🎉 领取 ${summary.claimed} 个`);
+        if (summary.already_claimed) parts.push(`已领 ${summary.already_claimed} 个`);
+        if (summary.no_campaign) parts.push(`无活动 ${summary.no_campaign} 个`);
+        if (summary.no_token) parts.push(`无token ${summary.no_token} 个`);
+        if (summary.error) parts.push(`失败 ${summary.error} 个`);
+        $('checkinMsg').className = summary.error ? 'msg err' : 'msg ok';
+        $('checkinMsg').textContent = parts.join('，') || '完成';
+        $('checkinResult').style.display = 'block';
+        $('checkinBox').textContent = JSON.stringify(res.results, null, 2);
+      } catch (e) {
+        $('checkinMsg').className = 'msg err';
+        $('checkinMsg').textContent = e.message;
+      } finally {
+        $('checkinBtn').disabled = false;
+      }
+    };
     $('logoutBtn').onclick = async () => {
       try {
         await api('/api/auth/logout', { method: 'POST', body: '{}' });
@@ -738,6 +799,28 @@
           const cell = document.querySelector(`[data-quota-id="${CSS.escape(id)}"]`);
           if (cell) cell.innerHTML = '<div class="quota muted">刷新中...</div>';
           await loadQuota(id);
+        } else if (act === 'checkin') {
+          btn.disabled = true;
+          const oldText = btn.textContent;
+          btn.textContent = '签到中...';
+          try {
+            const res = await api('/api/checkin', { method: 'POST', body: JSON.stringify({ account_id: id }) });
+            const r = (res.results || [])[0] || {};
+            const msgs = {
+              claimed: `🎉 领取成功 ${r.amount || ''} Credits`,
+              already_claimed: '今日已领取',
+              no_campaign: '无可用活动',
+              no_token: '无 token',
+              error: r.message || '失败',
+            };
+            alert(`${r.account || ''}: ${msgs[r.status] || r.message || r.status}`);
+            if (r.status === 'claimed') await loadQuota(id);
+          } catch (e) {
+            alert(e.message);
+          } finally {
+            btn.disabled = false;
+            btn.textContent = oldText;
+          }
         } else if (act === 'delete') {
           if (!confirm('确认删除该账号？')) return;
           await api('/api/accounts/delete', { method: 'POST', body: JSON.stringify({ id }) });

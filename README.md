@@ -11,11 +11,41 @@
 
 ---
 
+## ✨ 新功能：每日签到领 100 Credits
+
+控制台「账号列表 / 额度」区域内置一键签到，可将 Qoder 官方 **每日 100 Credits** 活动直接打进控制台：
+
+- **🎁 一键签到**：顶部按钮批量对所有账号签到
+- **🎁 单账号签到**：账号表格「操作」列独立签到按钮
+- **⏰ 每日自动签到**：可选开关（**默认关闭**），开启后每天 `10:00 (UTC+8)` 自动为全部账号签到
+- **幂等安全**：已领取自动跳过，重复点击不会重复领取
+
+> 签到链路基于抓包还原：`GET /sash/api/v1/me/campaigns` → `POST /sash/api/v1/me/campaigns/{id}/claim`，
+> 仅需 device token + `cosy-clienttype: 10`，无需签名。详见 `scripts/auto_checkin.py`。
+
+**手动签到 API**：
+
+```bash
+# 所有账号一键签到
+curl -X POST http://127.0.0.1:3588/api/checkin
+
+# 指定单账号
+curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
+```
+
+**开启每日自动签到**（默认关闭）：控制台勾选「每日 10:00 自动签到」即可，配置存于 `settings.json` 的 `auto_checkin` 字段。
+
+⚠️ 自动签到依赖服务常驻运行（电脑开机 + qoder2api 启动）。
+
+---
+
 ## 功能
 
+- 🎁 **每日签到**：一键/单账号/定时自动领取每日 100 Credits（见上）
 - 将 Qoder 账号转为本地兼容 API，供 **NewAPI**、**OpenCode**、**Claude Code**、**Codex** 等客户端使用
 - 多账号管理：支持 **OAuth** 与 **PAT**
-- 账号额度展示
+- 账号额度展示（套餐额度 + 个人拓展包分开显示）
+- 模型列表展示上下文窗口 / 最大输出 / 推理支持
 - 一键复制 NewAPI 渠道配置（Base URL + API Key）
 - 数据与密钥落盘，适合服务器常驻与保活
 

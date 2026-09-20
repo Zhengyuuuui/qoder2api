@@ -85,6 +85,9 @@ func main() {
 	// 控制台密码：环境变量 > settings；都没有则自动生成并落盘
 	_ = ensureConsolePassword()
 
+	// 每日 10:00 自动签到调度（需在控制台手动开启，默认关闭）
+	StartCheckinScheduler()
+
 	// 启动时尽量自动拉起 Bridge：优先激活账号，否则尝试任意有 secret 的账号
 	if err := svc.EnsureBridgeRunning(); err != nil {
 		logger.Error("auto start bridge failed: %v", err)
@@ -118,6 +121,7 @@ func main() {
 	mux.HandleFunc("/api/cleanup", handleCleanup)
 	mux.HandleFunc("/api/bridge/start", handleStartBridge)
 	mux.HandleFunc("/api/bridge/stop", handleStopBridge)
+	mux.HandleFunc("/api/checkin", handleCheckin)
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
 	addr := fmt.Sprintf("%s:%d", *bind, *webPort)
@@ -405,6 +409,7 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		BridgeToken     *string `json:"bridge_token"`
 		LogLevel        *string `json:"log_level"`
 		AutoStart       *bool   `json:"auto_start"`
+		AutoCheckin     *bool   `json:"auto_checkin"`
 		ConsolePassword *string `json:"console_password"`
 		// 新格式：包含旧密码和新密码
 		ConsolePasswordNew *struct {
@@ -440,6 +445,10 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AutoStart != nil {
 		cur.AutoStart = *req.AutoStart
+	}
+	if req.AutoCheckin != nil {
+		cur.AutoCheckin = *req.AutoCheckin
+		logger.Info("auto checkin set to %v", cur.AutoCheckin)
 	}
 	
 	// 处理新格式的密码修改

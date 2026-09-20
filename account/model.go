@@ -39,6 +39,7 @@ type Settings struct {
 	ConsolePassword      string                       `json:"console_password,omitempty"` // Web 控制台登录密码（类似 CPA management key）
 	ModelMapping         map[string]string            `json:"model_mapping,omitempty"`  // [DEPRECATED] 旧扁平映射（向后兼容，MapModel 中作为兜底回退使用）
 	ModelMappings        map[string]map[string]string `json:"model_mappings,omitempty"` // agent (claude/codex/gemini) → 客户端模型名 → Qoder model.key
+	AutoCheckin          bool                         `json:"auto_checkin"`             // 每日 10:00 自动签到（默认关闭）
 }
 
 type QuotaInfo struct {
