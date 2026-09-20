@@ -2,3 +2,7 @@ qoder2api
 *.exe
 *.log
 .DS_Store
+.ydevsphere/
+webconsole/index.html.bak
+webconsole/index.html.bak2
+scripts/capture/

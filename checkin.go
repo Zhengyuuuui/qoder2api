@@ -54,11 +54,11 @@ var checkinClient = &http.Client{
 // checkinHeaders 构造桌面端签到请求头（抓包确认的必需头）
 func checkinHeaders(deviceToken string) map[string]string {
 	return map[string]string{
-		"authorization":     "Bearer " + deviceToken,
-		"accept":            "application/json",
-		"accept-language":   "zh-CN",
-		"user-agent":        "Qoder",
-		"cosy-clienttype":   "10",
+		"authorization":   "Bearer " + deviceToken,
+		"accept":          "application/json",
+		"accept-language": "zh-CN",
+		"user-agent":      "Qoder",
+		"cosy-clienttype": "10",
 	}
 }
 
@@ -105,11 +105,11 @@ func doCheckinRequest(method, path, deviceToken string, reqBody interface{}) (in
 
 // campaignInfo 活动列表中的活动条目
 type campaignInfo struct {
-	CampaignID string `json:"campaignId"`
+	CampaignID  string `json:"campaignId"`
 	CampaignKey string `json:"campaignKey"`
-	ActionType string `json:"actionType"`
+	ActionType  string `json:"actionType"`
 	ClaimStatus string `json:"claimStatus"`
-	Benefit    *struct {
+	Benefit     *struct {
 		Kind   string `json:"kind"`
 		Amount int    `json:"amount"`
 	} `json:"benefit"`
@@ -117,12 +117,12 @@ type campaignInfo struct {
 
 // claimResponse 领取响应
 type claimResponse struct {
-	GrantID   string `json:"grantId"`
-	Status    string `json:"status"`
-	Replayed  bool   `json:"replayed"`
-	Benefit   *struct {
-		Kind   string `json:"kind"`
-		Amount int    `json:"amount"`
+	GrantID  string `json:"grantId"`
+	Status   string `json:"status"`
+	Replayed bool   `json:"replayed"`
+	Benefit  *struct {
+		Kind     string `json:"kind"`
+		Amount   int    `json:"amount"`
 		Validity *struct {
 			Mode string `json:"mode"`
 			Days int    `json:"days"`
@@ -366,8 +366,8 @@ func tryDailyCheckin(deviceToken string, res *CheckinResult) (CheckinResult, boo
 
 	// 409 AlreadyExists = 今日已领取（与 campaigns 领取状态共享）
 	if status == 409 {
-			res.Status = checkinStatusAlreadyClaimed
-			res.Message = "今日已领取"
+		res.Status = checkinStatusAlreadyClaimed
+		res.Message = "今日已领取"
 		return *res, true
 	}
 
@@ -460,7 +460,7 @@ func campaignsCheckin(deviceToken string, res *CheckinResult) CheckinResult {
 	if target == nil {
 		if alreadyClaimed {
 			res.Status = checkinStatusAlreadyClaimed
-		res.Message = "今日已领取"
+			res.Message = "今日已领取"
 		} else {
 			res.Status = checkinStatusNoCampaign
 			res.Message = "无可用签到活动"
@@ -602,8 +602,8 @@ func handleCheckin(w http.ResponseWriter, r *http.Request) {
 // ---------- 每日 10:00 自动签到调度 ----------
 
 var (
-	checkinMu       sync.Mutex
-	lastCheckinDay  string // 最近一次自动签到的日期 (YYYY-MM-DD)，防止同日重复
+	checkinMu      sync.Mutex
+	lastCheckinDay string // 最近一次自动签到的日期 (YYYY-MM-DD)，防止同日重复
 )
 
 // StartCheckinScheduler 启动后台调度器（非阻塞）

@@ -1,11 +1,11 @@
 package bridge
 
 import (
-	"qoder2api/internal/cosy"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"qoder2api/internal/cosy"
 	"strings"
 	"time"
 
@@ -173,7 +173,19 @@ func (b *Bridge) HandleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		})
 		if err != nil {
 			logger.Error("[Claude][%s] stream 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
-			fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+			// Claude SSE 协议要求 error 事件的 data 为 JSON；纯文本会被客户端解析失败
+			errMsg, errType := FriendlyError(err)
+			if errType == "" || errType == "qoder_error" {
+				errType = "api_error"
+			}
+			payload, _ := json.Marshal(map[string]interface{}{
+				"type": "error",
+				"error": map[string]interface{}{
+					"type":    errType,
+					"message": errMsg,
+				},
+			})
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(payload))
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -250,7 +262,7 @@ func (b *Bridge) HandleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		})
 		if err != nil {
 			logger.Error("[Claude][%s] 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
-			WriteClaudeErr(w, fmt.Errorf("request failed: %w", err))
+			WriteClaudeErr(w, err)
 			return
 		}
 
@@ -324,17 +336,17 @@ func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 			maxOut = 32768
 		}
 		entry := map[string]interface{}{
-			"id":               m.Key,
-			"object":           "model",
-			"created":          1687864820,
-			"owned_by":         "qoder",
-			"display_name":     m.DisplayName,
-			"context_window":   ctxWin,
+			"id":                m.Key,
+			"object":            "model",
+			"created":           1687864820,
+			"owned_by":          "qoder",
+			"display_name":      m.DisplayName,
+			"context_window":    ctxWin,
 			"max_output_tokens": maxOut,
-			"enable":          m.Enable,
-			"is_default":      m.IsDefault,
-			"is_reasoning":    m.IsReasoning,
-			"price_factor":    m.PriceFactor,
+			"enable":            m.Enable,
+			"is_default":        m.IsDefault,
+			"is_reasoning":      m.IsReasoning,
+			"price_factor":      m.PriceFactor,
 		}
 		data = append(data, entry)
 	}
@@ -354,15 +366,20 @@ func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func WriteClaudeErr(w http.ResponseWriter, err error) {
+	// 友好中文消息 + 分类类型（内容审核/瞬时/普通）
+	errMsg, errType := FriendlyError(err)
+	if errType == "" || errType == "qoder_error" {
+		errType = "api_error"
+	}
 	body, _ := json.Marshal(map[string]interface{}{
 		"type": "error",
 		"error": map[string]interface{}{
-			"type":    "api_error",
-			"message": err.Error(),
+			"type":    errType,
+			"message": errMsg,
 		},
 	})
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(500)
+	w.WriteHeader(ErrorStatus(err))
 	w.Write(body)
 }
 

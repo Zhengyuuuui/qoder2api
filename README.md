@@ -39,10 +39,55 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 
 ---
 
+## 更新记录
+
+### 流稳定性 / 错误分类 / 安全加固
+
+**上游流处理（对齐 hub 行为）**
+
+- **错误帧及时中止**：上游 HTTP200 建流后在信封里投递错误帧（418/5xx 等）且不关流时，
+  网关立即停止读取并按瞬时故障自动重开上游（有界重试，对调用方无感），请求不再挂起
+- **空流显式报错**：上游建流成功但零有效帧即关流时返回 `empty upstream stream`；
+  三协议流式路径输出 error 事件帧（chat 为 data 错误帧，claude/codex 为 `event: error`），
+  非流式路径返回 500 + 错误 JSON（此前为空内容正常 finish，属与 hub 对齐的有意变更）
+- **错误四分类**：上游错误按「内容审核 / 瞬时可重试 / 客户端参数 / 普通上游」分类，
+  对客户端输出友好中文消息与正确 HTTP 状态（内容审核 400、瞬时耗尽 502 等）；
+  同账号瞬时故障（418/5xx/传输抖动）连接层 1s/2s 退避自动重试
+- **usage 同帧合并**：上游同帧返回 usage + choices 时，token 用量与内容一并返回，不再二选一
+
+**安全**
+
+- **Bridge 端点鉴权**：`/v1/*` 必须携带 API Key（默认 `qccg`，控制台可修改）——
+  支持 `Authorization: Bearer <token>` 或 `x-api-key: <token>`，常量时间比较；
+  OPTIONS 预检直接 204 放行；校验失败返回 401 + OpenAI 风格错误体。
+  同网络无凭证客户端不再能消耗账号配额
+- **短 token 防护**：误粘贴短 token 不再导致启动 panic，日志只输出前缀
+- **PII 降级**：userinfo 原始响应日志降为 Debug 级并截断 500 字节，默认日志级别不再落盘
+- **未跟踪文件隔离**：`.gitignore` 新增 `.ydevsphere/`、`webconsole/*.bak*`、`scripts/capture/`
+  （抓包流量目录，可能含凭证，仅存本地、不入库，请自行处理）
+
+**设备指纹与可观测性**
+
+- **本机指纹盐**：`settings.json` 的 `machine_salt` 首次启动自动生成，使每个部署的
+  指纹派生空间独立（uid + 本机盐派生机器码，重启不变）；**勿手动修改，变更即全部账号指纹漂移**
+- **盐降级明示**：盐加载失败时日志明确写出「运行于无盐模式（hub 兼容指纹），下次启动
+  恢复加盐将导致全部账号指纹漂移」；成功输出 `machine salt loaded (len=N)`；
+  `cmd/checkin` 调试工具失败时向 stderr 告警（不阻断运行）
+
+**测试与工具**
+
+- `internal/bridge`、`internal/cosy` 新增单元/回归测试（信封重试闸门、错误帧停读信号、
+  空流报错、usage 合并、指纹派生等），离线可跑、无外部依赖
+- 新增 `cmd/checkin` 调试工具（只读查询活动/额度接口）与 `scripts/` 签到辅助脚本
+  （`checkin.py` 等，凭证运行时从本地数据目录读取，无硬编码）
+
+---
+
 ## 功能
 
 - 🎁 **每日签到**：一键/单账号/定时自动领取每日 100 Credits（见上）
 - 将 Qoder 账号转为本地兼容 API，供 **NewAPI**、**OpenCode**、**Claude Code**、**Codex** 等客户端使用
+- Bridge 端点鉴权：`/v1/*` 需携带 API Key（默认 `qccg`，控制台可改）
 - 多账号管理：支持 **OAuth** 与 **PAT**
 - 账号额度展示（套餐额度 + 个人拓展包分开显示）
 - 模型列表展示上下文窗口 / 最大输出 / 推理支持
@@ -153,11 +198,11 @@ http://<服务器IP>:3588
 # 查看状态
 curl http://127.0.0.1:3588/api/status
 
-# 确认 Bridge 模型列表
-curl http://127.0.0.1:8963/v1/models
+# 确认 Bridge 模型列表（需携带 API Key，默认 qccg）
+curl -H "x-api-key: qccg" http://127.0.0.1:8963/v1/models
 ```
 
-若返回模型 JSON，说明桥已正常。
+若返回模型 JSON，说明桥已正常；返回 401 说明 API Key 缺失或不匹配。
 
 ---
 
@@ -283,11 +328,14 @@ sudo systemctl enable --now qoder2api
 qoder2api/
 ├── main.go              # 入口：Web + API
 ├── service.go           # 账号 / Bridge 业务
+├── checkin.go           # 每日签到（手动 API + 10:00 自动调度）
 ├── account/             # 账号、OAuth、设置、密钥文件存储
+├── cmd/checkin/         # 签到/额度只读调试工具
 ├── internal/
-│   ├── bridge/          # OpenAI / Claude / Codex 兼容层
-│   └── cosy/            # Qoder 签名与会话
+│   ├── bridge/          # OpenAI / Claude / Codex 兼容层 + 错误分类
+│   └── cosy/            # Qoder 签名、会话与设备指纹
 ├── logger/
+├── scripts/             # 签到辅助脚本与抓包工具
 ├── webconsole/          # 轻量 HTML 控制台
 ├── baseprompt.json
 ├── Dockerfile

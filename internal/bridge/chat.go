@@ -1,11 +1,11 @@
 package bridge
 
 import (
-	"qoder2api/internal/cosy"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"qoder2api/internal/cosy"
 	"strings"
 	"time"
 
@@ -90,8 +90,9 @@ func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		})
 		if err != nil {
 			logger.Error("[Chat][%s] stream 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
+			errMsg, errType := FriendlyError(err)
 			errData, _ := json.Marshal(map[string]interface{}{
-				"error": map[string]interface{}{"message": err.Error(), "type": "qoder_error"},
+				"error": map[string]interface{}{"message": errMsg, "type": errType},
 			})
 			fmt.Fprintf(w, "data: %s\n\n", string(errData))
 			if flusher != nil {
@@ -110,9 +111,9 @@ func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ch["delta"] = map[string]interface{}{}
 		if totalInputTokens > 0 || totalOutputTokens > 0 {
 			done["usage"] = map[string]interface{}{
-				"prompt_tokens": totalInputTokens,
+				"prompt_tokens":     totalInputTokens,
 				"completion_tokens": totalOutputTokens,
-				"total_tokens": totalInputTokens + totalOutputTokens,
+				"total_tokens":      totalInputTokens + totalOutputTokens,
 			}
 		}
 		data, _ := json.Marshal(done)
@@ -139,7 +140,7 @@ func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		})
 		if err != nil {
 			logger.Error("[Chat][%s] 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
-			WriteErr(w, fmt.Errorf("request failed: %w", err))
+			WriteErr(w, err)
 			return
 		}
 		finishReason := "stop"
@@ -200,10 +201,15 @@ func WriteJSON(w http.ResponseWriter, v interface{}) {
 }
 
 func WriteErr(w http.ResponseWriter, err error) {
+	// 结构化上游错误 → 友好中文消息 + 分类类型（内容审核/瞬时/普通）
+	errMsg, errType := FriendlyError(err)
+	if errType == "" {
+		errType = "qoder_error"
+	}
 	body, _ := json.Marshal(map[string]interface{}{
-		"error": map[string]interface{}{"message": err.Error(), "type": "qoder_error"},
+		"error": map[string]interface{}{"message": errMsg, "type": errType},
 	})
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(500)
+	w.WriteHeader(ErrorStatus(err))
 	w.Write(body)
 }

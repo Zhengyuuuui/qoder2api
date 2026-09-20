@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -64,8 +65,9 @@ func FetchUserInfoWithToken(token string, region account.Region) (map[string]int
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, err
 	}
-	// DEBUG: dump raw userinfo to understand actual response structure
-	logger.Info("userinfo raw (%d bytes): %s", len(raw), string(raw))
+	// DEBUG 用途排查原始 userinfo 响应结构：降为 Debug 级并截断至 500 字节，
+	// 默认日志级别不再落盘用户名/组织等 PII，保留低级别排查能力
+	logger.Debug("userinfo raw (%d bytes): %s", len(raw), truncate(string(raw), 500))
 	return result, nil
 }
 
@@ -74,19 +76,30 @@ type Bridge struct {
 	client       *BearerClient
 	region       account.Region
 	templateBase map[string]interface{}
+	// chatStreamURL 测试注入用：非空时覆盖 region 对应的上游 chat 流地址
+	chatStreamURL string
 }
 
 // QoderModel 是返回给前端的精简模型条目（仅保留下拉选择必要字段）
 type QoderModel struct {
-	Key            string  `json:"key"`
-	DisplayName    string  `json:"display_name"`
-	Enable         bool    `json:"enable"`
-	IsDefault      bool    `json:"is_default"`
-	IsReasoning    bool    `json:"is_reasoning,omitempty"`
-	ContextWindow  int     `json:"context_window,omitempty"`
-	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
-	MaxInputTokens int     `json:"max_input_tokens,omitempty"`
-	PriceFactor    float64 `json:"price_factor,omitempty"`
+	Key             string  `json:"key"`
+	DisplayName     string  `json:"display_name"`
+	Enable          bool    `json:"enable"`
+	IsDefault       bool    `json:"is_default"`
+	IsReasoning     bool    `json:"is_reasoning,omitempty"`
+	ContextWindow   int     `json:"context_window,omitempty"`
+	MaxOutputTokens int     `json:"max_output_tokens,omitempty"`
+	MaxInputTokens  int     `json:"max_input_tokens,omitempty"`
+	PriceFactor     float64 `json:"price_factor,omitempty"`
+}
+
+// tokenPrefix 安全截取 token 前 n 字节用于日志展示（不足 n 返回全串）。
+// 防止用户误粘贴短 token 时 pat[:10] 之类切片越界 panic；日志只输出前缀不输出全文。
+func tokenPrefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 // NewBridge 创建 API 转换桥接。
@@ -94,11 +107,7 @@ type QoderModel struct {
 //  1. OAuth device token (dt-xxx): 直接使用，调用 /api/v1/userinfo 获取用户信息
 //  2. Personal Access Token (PAT): 调用 ExchangeJobToken 转换为 session token
 func NewBridge(pat string, region account.Region, templateBase map[string]interface{}) (*Bridge, error) {
-	mid := cosy.NewUUID()
-	mtoken := cosy.NewBase64Token()
-	mtype := cosy.NewHexToken(18)
-
-	logger.Info("Bridge using token: %s (prefix: %s)", pat[:10]+"...", pat[:4])
+	logger.Info("Bridge using token: %s (prefix: %s)", tokenPrefix(pat, 10), tokenPrefix(pat, 4))
 
 	var identity cosy.AuthIdentity
 	var name, id string
@@ -122,7 +131,10 @@ func NewBridge(pat string, region account.Region, templateBase map[string]interf
 			RefreshToken:       refreshToken,
 		}
 	} else {
-		jt, err := cosy.ExchangeJobToken(pat, mid, mtoken, mtype, account.GetEndpoints(region).JobTokenURL)
+		// jobToken 交换发生在拿到 uid 之前：机器头用凭证种子稳定派生
+		// （hub 的交换请求不带机器头，此处保留 QCCG 原有行为但消除随机漂移）
+		seed := cosy.FingerprintSeed("", pat)
+		jt, err := cosy.ExchangeJobToken(pat, cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed), account.GetEndpoints(region).JobTokenURL)
 		if err != nil {
 			return nil, fmt.Errorf("exchangeJobToken: %w", err)
 		}
@@ -139,6 +151,12 @@ func NewBridge(pat string, region account.Region, templateBase map[string]interf
 	}
 
 	logger.Info("Bridge session for %s (%s)", name, id)
+	// 稳定设备指纹：优先 uid 派生（双区统一、重启不变），uid 缺失退回凭证种子
+	seed := cosy.FingerprintSeed(id, pat)
+	mid := cosy.DeriveMachineID(seed)
+	mtoken := cosy.DeriveMachineToken(seed)
+	mtype := cosy.DeriveMachineType(seed)
+	logger.Info("Bridge fingerprint machineid=%s (stable derive)", mid)
 	sess, err := cosy.NewSession(identity, mid, mtoken, mtype)
 	if err != nil {
 		return nil, err
@@ -264,6 +282,36 @@ func (b *Bridge) CallQoder(ctx context.Context, agent string, messages []interfa
 	return b.CallQoderWithOpts(ctx, agent, messages, model, tools, CallOpts{}, onDelta)
 }
 
+// deltaDispatcher 把上游 SSE 行分发为 Delta 回调，返回值供 openStreamLines
+// 的 onLine 使用：false 表示停止读取上游流。
+// 约束（review P1）：一旦捕获到流内业务错误（*upstreamErr 非 nil），
+// 立即停止向 onDelta 分发任何后续 delta，且从置位错误的那一行起返回 false，
+// 让 openStreamLines 及时退出——上游发出错误帧后若不关流，否则重开闸门
+// 永不触发、请求挂起；错误由 CallQoder 在流结束后统一返回。
+func deltaDispatcher(onDelta func(Delta), upstreamErr *error) func(string) bool {
+	return func(line string) bool {
+		if *upstreamErr != nil {
+			return false
+		}
+		if !strings.HasPrefix(line, "data:") {
+			return true
+		}
+		dataPayload := strings.TrimSpace(line[5:])
+		if dataPayload == "[DONE]" {
+			return true
+		}
+		delta := ExtractDelta(dataPayload)
+		if delta.Err != nil {
+			*upstreamErr = delta.Err
+			return false
+		}
+		if !delta.isEmpty() {
+			onDelta(delta)
+		}
+		return true
+	}
+}
+
 func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) error {
 	// 将客户端模型名（claude-sonnet-4-6 等）映射成 Qoder 上游内部 model.key（auto/qmodel_38max/gmodel/dmodel 等）。
 	// 上游对未知 key 会走兜底返回内容，但不会把这次调用计入 quota，这是「请求成功但 dashboard 无用量」的根因。
@@ -350,6 +398,9 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	}
 
 	qurl := qoderChatStreamURL(b.region)
+	if b.chatStreamURL != "" {
+		qurl = b.chatStreamURL
+	}
 	extra := map[string]string{
 		"x-model-key":    model,
 		"x-model-source": mcSource,
@@ -362,28 +413,69 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	logger.Info("callQoder model=%s prompt=%s", model, preview)
 	logger.Debug("callQoder request body: %s", func() string { d, _ := json.Marshal(body); return string(d) }())
 
-	var upstreamErr error
-	streamErr := b.client.openStreamLines(ctx, qurl, body, extra, func(line string) {
-		if !strings.HasPrefix(line, "data:") {
-			return
+	// ---- SSE 信封重试闸门（第 3 步，参照 hub should_retry_envelope /
+	// aggregate_with_envelope_retry）------------------------------------------
+	// 关键形态：上游 HTTP200 建流后才在信封里投 418/5xx，连接层重试覆盖不到。
+	// 闸门规则：只要「尚未向 onDelta 发出任何非空 delta」且错误属瞬时类
+	// （信封 418/5xx/provider_error、传输层 TLS EOF 等），就重开上游重试，
+	// 对调用方无感；已发出内容则直接上抛，避免客户端收到重复内容。
+	// 客户端参数错 / 内容审核 / 401/429 经 IsTransientUpstream 判定为
+	// 不可重试，快速失败。闸门做在此处，chat/claude/codex 三协议的
+	// 流式与非流式路径全部自动覆盖。
+	// 说明：连接阶段错误已在 openStreamLines 内部重试过；此处重开是
+	// 第二层防护（有界：最多 TransientMaxRetries 次），主要覆盖流内信封错误。
+	var lastErr error
+	for attempt := 0; attempt <= TransientMaxRetries; attempt++ {
+		if attempt > 0 {
+			if serr := sleepCtx(ctx, RetryBackoff(attempt)); serr != nil {
+				return lastErr
+			}
+			logger.Info("reopen upstream after in-stream error (try %d/%d): %v",
+				attempt+1, TransientMaxRetries+1, lastErr)
 		}
-		dataPayload := strings.TrimSpace(line[5:])
-		if dataPayload == "[DONE]" {
-			return
+		emitted := false
+		var upstreamErr error
+		onDeltaWrapped := func(d Delta) {
+			if !d.isEmpty() {
+				emitted = true
+			}
+			onDelta(d)
 		}
-		delta := ExtractDelta(dataPayload)
-		if delta.Err != nil {
-			upstreamErr = delta.Err
-			return
+		streamErr := b.client.openStreamLines(ctx, qurl, body, extra,
+			deltaDispatcher(onDeltaWrapped, &upstreamErr))
+		if upstreamErr == nil && streamErr == nil {
+			// 上游正常关流但未发出任何有效 delta/usage 帧：对齐 hub
+			// "empty upstream stream" 显式报错（不纳入重开闸门——
+			// isRetryableStreamError 对哨兵错误自然返回 false，不重试）
+			if !emitted {
+				return ErrEmptyStream
+			}
+			return nil
 		}
-		if !delta.isEmpty() {
-			onDelta(delta)
+		if upstreamErr != nil {
+			lastErr = upstreamErr
+		} else {
+			lastErr = streamErr
 		}
-	})
-	if upstreamErr != nil {
-		return upstreamErr
+		if emitted || attempt >= TransientMaxRetries || !isRetryableStreamError(lastErr) {
+			return lastErr
+		}
 	}
-	return streamErr
+	return lastErr
+}
+
+// isRetryableStreamError 判定流内/连接错误是否值得重开上游：
+// 结构化上游错误按瞬时分类判定；裸传输错误（TLS EOF 等）按传输层判定；
+// ctx 取消、业务错误、内容审核等一律不可重试。
+func isRetryableStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *UpstreamError
+	if errors.As(err, &ue) {
+		return IsTransientUpstream(ue.Status, ue.Detail)
+	}
+	return IsTransientTransport(err)
 }
 
 // RedactRequestBodyJSON 接收原始请求 JSON 字节，深拷贝后把可能含敏感对话内容的字段

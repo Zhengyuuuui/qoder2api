@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"qoder2api/account"
+	"qoder2api/internal/cosy"
 	"qoder2api/logger"
 )
 
@@ -75,6 +76,18 @@ func main() {
 
 	svc = NewService(basePromptRaw)
 	svc.LoadRuntimeSettings()
+
+	// 设备指纹本机盐：首次启动自动生成并落盘（settings.json machine_salt）。
+	// 使每个部署的指纹派生空间独立，防止 uid 派生模式被上游全局识别；
+	// 生成后保持不变——变更 salt 即所有账号指纹整体漂移（等价于换设备）。
+	if salt, err := account.EnsureMachineSalt(); err == nil {
+		cosy.SetInstallSalt(salt)
+		logger.Info("machine salt loaded (len=%d), fingerprints salted", len(salt))
+	} else {
+		// 仅提升可观测性、不阻断启动：无盐模式可继续排障，但后果必须明示
+		logger.Error("init machine salt: %v；运行于无盐模式（hub 兼容指纹），下次启动恢复加盐将导致全部账号指纹漂移", err)
+	}
+
 	if *bridgePort > 0 {
 		svc.bridgePort = *bridgePort
 	}
@@ -393,9 +406,9 @@ func handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	hasConsolePwd := strings.TrimSpace(out.ConsolePassword) != "" || strings.TrimSpace(os.Getenv("QODER2API_CONSOLE_PASSWORD")) != ""
 	out.ConsolePassword = ""
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"settings":              out,
-		"connection":            connectionInfo(),
-		"console_password_set":  hasConsolePwd,
+		"settings":             out,
+		"connection":           connectionInfo(),
+		"console_password_set": hasConsolePwd,
 	})
 }
 
@@ -413,7 +426,7 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		ConsolePassword *string `json:"console_password"`
 		// 新格式：包含旧密码和新密码
 		ConsolePasswordNew *struct {
-			OldPassword string `json:"old_password"`
+			OldPassword string  `json:"old_password"`
 			NewPassword *string `json:"new_password"`
 		} `json:"console_password_new"`
 	}
@@ -450,7 +463,7 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		cur.AutoCheckin = *req.AutoCheckin
 		logger.Info("auto checkin set to %v", cur.AutoCheckin)
 	}
-	
+
 	// 处理新格式的密码修改
 	if req.ConsolePasswordNew != nil {
 		oldPwd := strings.TrimSpace(req.ConsolePasswordNew.OldPassword)
@@ -458,21 +471,21 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		if req.ConsolePasswordNew.NewPassword != nil {
 			newPwd = strings.TrimSpace(*req.ConsolePasswordNew.NewPassword)
 		}
-		
+
 		// 验证旧密码
 		currentPassword := effectiveConsolePassword()
 		if currentPassword == "" {
 			writeError(w, http.StatusUnauthorized, fmt.Errorf("当前未设置控制台密码"))
 			return
 		}
-		
+
 		a := sha256.Sum256([]byte(oldPwd))
 		b := sha256.Sum256([]byte(currentPassword))
 		if subtle.ConstantTimeCompare(a[:], b[:]) != 1 {
 			writeError(w, http.StatusUnauthorized, fmt.Errorf("旧密码错误"))
 			return
 		}
-		
+
 		// 如果提供了新密码，则更新
 		if newPwd != "" {
 			cur.ConsolePassword = newPwd
@@ -484,7 +497,7 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 			cur.ConsolePassword = p
 		}
 	}
-	
+
 	if err := svc.SaveSettings(cur); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return

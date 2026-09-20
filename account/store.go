@@ -1,6 +1,8 @@
 package account
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -203,4 +205,26 @@ func SaveSettings(s *Settings) error {
 		return err
 	}
 	return os.WriteFile(path, data, 0600)
+}
+
+// EnsureMachineSalt 读取（或首次生成并落盘）本机设备指纹盐（settings.json machine_salt）。
+// 用途：使每个部署的指纹派生空间独立，防止 uid 派生模式被上游全局识别。
+// 生成后保持不变——变更 salt 即所有账号指纹整体漂移（等价于换设备）。
+func EnsureMachineSalt() (string, error) {
+	st, err := LoadSettings()
+	if err != nil || st == nil {
+		st = &Settings{Port: 8963, LogLevel: "info"}
+	}
+	if st.MachineSalt != "" {
+		return st.MachineSalt, nil
+	}
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	st.MachineSalt = hex.EncodeToString(b)
+	if err := SaveSettings(st); err != nil {
+		return "", err
+	}
+	return st.MachineSalt, nil
 }

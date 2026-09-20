@@ -30,10 +30,11 @@ func ProbeCNEndpoints(token string) {
 		uid = id
 	}
 
-	// Create session
-	mid := cosy.NewUUID()
-	mtoken := cosy.NewBase64Token()
-	mtype := cosy.NewHexToken(18)
+	// Create session（稳定指纹：uid 已知，优先 uid 派生）
+	seed := cosy.FingerprintSeed(uid, token)
+	mid := cosy.DeriveMachineID(seed)
+	mtoken := cosy.DeriveMachineToken(seed)
+	mtype := cosy.DeriveMachineType(seed)
 
 	identity := cosy.AuthIdentity{
 		Name:               "",

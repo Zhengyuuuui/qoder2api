@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -15,15 +16,15 @@ import (
 )
 
 type QoderModel struct {
-	Key            string  `json:"id"`
-	DisplayName    string  `json:"display_name"`
-	Enable         bool    `json:"enable"`
-	IsDefault      bool    `json:"is_default"`
-	IsReasoning    bool    `json:"is_reasoning,omitempty"`
-	ContextWindow  int     `json:"context_window,omitempty"`
-	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
-	MaxInputTokens int     `json:"max_input_tokens,omitempty"`
-	PriceFactor    float64 `json:"price_factor,omitempty"`
+	Key             string  `json:"id"`
+	DisplayName     string  `json:"display_name"`
+	Enable          bool    `json:"enable"`
+	IsDefault       bool    `json:"is_default"`
+	IsReasoning     bool    `json:"is_reasoning,omitempty"`
+	ContextWindow   int     `json:"context_window,omitempty"`
+	MaxOutputTokens int     `json:"max_output_tokens,omitempty"`
+	MaxInputTokens  int     `json:"max_input_tokens,omitempty"`
+	PriceFactor     float64 `json:"price_factor,omitempty"`
 }
 
 type Service struct {
@@ -70,11 +71,9 @@ func (s *Service) ListAccounts() []account.Account {
 func (s *Service) AddAccountByPAT(pat, region string) (*account.Account, error) {
 	r := account.NormalizeRegion(region)
 	ep := account.GetEndpoints(r)
-	mid := cosy.NewUUID()
-	mtoken := cosy.NewBase64Token()
-	mtype := cosy.NewHexToken(18)
-
-	jt, err := cosy.ExchangeJobToken(pat, mid, mtoken, mtype, ep.JobTokenURL)
+	// 交换时尚无 uid：机器头按凭证稳定派生，避免每次导入生成新机器码
+	seed := cosy.FingerprintSeed("", pat)
+	jt, err := cosy.ExchangeJobToken(pat, cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed), ep.JobTokenURL)
 	if err != nil {
 		return nil, fmt.Errorf("验证 PAT 失败: %w", err)
 	}
@@ -189,6 +188,36 @@ func (s *Service) restartBridge(acct *account.Account) error {
 	return s.startBridgeWithAccount(acct)
 }
 
+// authMiddleware Bridge 端点（/v1/*）鉴权中间件：
+// 接受 Authorization: Bearer <token> 或 x-api-key: <token>；
+// token 每次请求实时取 svc.EffectiveToken()，容忍运行中改配置；
+// 比较用 crypto/subtle.ConstantTimeCompare 防时序侧信道；
+// OPTIONS 预检直接放行（204），避免浏览器客户端 CORS 失败；
+// 校验失败返回 401 + OpenAI 风格错误体。
+func (s *Service) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		logger.Info("[HTTP] %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		token := ""
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			token = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		} else if k := r.Header.Get("x-api-key"); k != "" {
+			token = k
+		}
+		expect := s.EffectiveToken()
+		if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(expect)) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"error":{"message":"invalid api key","type":"authentication_error"}}`)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Service) startBridgeWithAccount(acct *account.Account) error {
 	logger.Info("startBridgeWithAccount: account=%s", acct.Name)
 	pat, err := account.GetSecret(acct.ID)
@@ -215,10 +244,8 @@ func (s *Service) startBridgeWithAccount(acct *account.Account) error {
 	mux.HandleFunc("/v1/models", b.HandleListModels)
 	mux.HandleFunc("/v1/responses", b.HandleCodexResponses)
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		logger.Info("[HTTP] %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
-		mux.ServeHTTP(w, r)
-	})
+	// mux 外包鉴权中间件：同网络客户端必须携带有效 token 才能消耗账号配额
+	handler := s.authMiddleware(mux)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf("0.0.0.0:%d", s.bridgePort),
@@ -273,7 +300,8 @@ func (s *Service) GetAccountQuota(accountID string) (*account.QuotaInfo, error) 
 		token = deviceToken
 	} else {
 		ep := account.GetEndpoints(acct.Region)
-		jt, err := cosy.ExchangeJobToken(token, cosy.NewUUID(), cosy.NewBase64Token(), cosy.NewHexToken(18), ep.JobTokenURL)
+		seed := cosy.FingerprintSeed("", token)
+		jt, err := cosy.ExchangeJobToken(token, cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed), ep.JobTokenURL)
 		if err != nil {
 			return nil, fmt.Errorf("exchange token: %w", err)
 		}
@@ -305,14 +333,14 @@ func (s *Service) ListQoderModels() ([]QoderModel, error) {
 	out := make([]QoderModel, len(models))
 	for i, m := range models {
 		out[i] = QoderModel{
-			Key:            m.Key,
-			DisplayName:    m.DisplayName,
-			Enable:         m.Enable,
-			IsDefault:      m.IsDefault,
-			IsReasoning:    m.IsReasoning,
-			MaxInputTokens: m.MaxInputTokens,
-			PriceFactor:    m.PriceFactor,
-			ContextWindow:  m.ContextWindow,
+			Key:             m.Key,
+			DisplayName:     m.DisplayName,
+			Enable:          m.Enable,
+			IsDefault:       m.IsDefault,
+			IsReasoning:     m.IsReasoning,
+			MaxInputTokens:  m.MaxInputTokens,
+			PriceFactor:     m.PriceFactor,
+			ContextWindow:   m.ContextWindow,
 			MaxOutputTokens: m.MaxOutputTokens,
 		}
 	}

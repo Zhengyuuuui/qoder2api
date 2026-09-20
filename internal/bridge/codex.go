@@ -1,11 +1,11 @@
 package bridge
 
 import (
-	"qoder2api/internal/cosy"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"qoder2api/internal/cosy"
 	"strings"
 	"time"
 
@@ -112,9 +112,10 @@ func (b *Bridge) HandleCodexResponses(w http.ResponseWriter, r *http.Request) {
 		})
 		if err != nil {
 			logger.Error("[Codex][%s] stream 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
+			errMsg, _ := FriendlyError(err)
 			writeEvent("error", map[string]interface{}{
 				"type":    "error",
-				"message": err.Error(),
+				"message": errMsg,
 			})
 			return
 		}
@@ -188,7 +189,7 @@ func (b *Bridge) HandleCodexResponses(w http.ResponseWriter, r *http.Request) {
 		})
 		if err != nil {
 			logger.Error("[Codex][%s] 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
-			WriteCodexErr(w, fmt.Errorf("request failed: %w", err))
+			WriteCodexErr(w, err)
 			return
 		}
 
@@ -296,10 +297,15 @@ func CodexInputToMessages(input interface{}, instructions string) []interface{} 
 }
 
 func WriteCodexErr(w http.ResponseWriter, err error) {
+	// 友好中文消息 + 分类类型（内容审核/瞬时/普通）
+	errMsg, errType := FriendlyError(err)
+	if errType == "" || errType == "qoder_error" {
+		errType = "server_error"
+	}
 	body, _ := json.Marshal(map[string]interface{}{
-		"error": map[string]interface{}{"message": err.Error(), "type": "server_error"},
+		"error": map[string]interface{}{"message": errMsg, "type": errType},
 	})
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(500)
+	w.WriteHeader(ErrorStatus(err))
 	w.Write(body)
 }
