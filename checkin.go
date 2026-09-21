@@ -293,13 +293,15 @@ func checkinAccount(acct *account.Account) CheckinResult {
 		return res
 	}
 
-	// ========== 主流程：daily-check-in 简化端点 ==========
-	if r, ok := tryDailyCheckin(deviceToken, &res); ok {
-		return finalizeCheckin(acct.ID, r)
-	}
+	// ========== 权威领取：campaigns 流程（真实发放积分的系统） ==========
+	// 注意：不走 daily-check-in/claim —— 该 legacy 端点已 DISABLED，
+	// 却对未领取日也恒返回 409，会误判"已领取"导致跳过真实领取（实测 2026-09-21 不发积分）
+	r := campaignsCheckin(deviceToken, &res)
 
-	// ========== 兜底：campaigns 流程 ==========
-	return finalizeCheckin(acct.ID, campaignsCheckin(deviceToken, &res))
+	// 只读补充 legacy 统计（DISABLED 时恒 0，不影响结果；上游恢复后可提供 streak）
+	readDailyCheckinStats(deviceToken, &r)
+
+	return finalizeCheckin(acct.ID, r)
 }
 
 // finalizeCheckin 收尾：写入/读取本地签到历史并把统计拼进消息
@@ -324,81 +326,42 @@ func finalizeCheckin(accountID string, r CheckinResult) CheckinResult {
 	return r
 }
 
-// tryDailyCheckin 尝试 daily-check-in 简化端点；返回 (result, handled)
-// 流程：GET status 拿连续签到统计 → POST claim 幂等领取（409=今日已领）
-// 端点不可用/异常时返回 handled=false，由调用方回退到 campaigns 流程
-func tryDailyCheckin(deviceToken string, res *CheckinResult) (CheckinResult, bool) {
-	// Step 1: 查询签到状态（拿连续天数统计）
+// readDailyCheckinStats 只读获取 legacy daily-check-in 的统计（绝不通过它领取！）
+// 背景：该端点的 legacy 活动已 DISABLED，claim 会恒返回 409 造成误判，
+// 且不发放任何积分（2026-09-21 实测）。真实领取只走 campaigns 流程。
+// 上游恢复后若返回非 0 统计，可作为 streak 的补充数据源。
+func readDailyCheckinStats(deviceToken string, res *CheckinResult) {
 	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/daily-check-in/status", deviceToken, nil)
-
-	// 404/501 = 端点不存在 → 回退
-	if status == 404 || status == 501 {
-		logger.Info("[Checkin] daily-check-in/status not available (HTTP %d), fallback to campaigns", status)
-		return *res, false
-	}
-	if status == 401 {
-		res.Message = fmt.Sprintf("token 无效: %s", truncate(raw, 200))
-		return *res, true
-	}
 	if status != 200 {
-		logger.Info("[Checkin] daily-check-in/status HTTP %d, fallback: %s", status, truncate(raw, 200))
-		return *res, false
+		if status != 404 && status != 401 {
+			logger.Info("[Checkin] daily-check-in/status HTTP %d: %s", status, truncate(raw, 150))
+		}
+		return
 	}
 
-	// 解析状态与统计
 	var st dailyCheckinStatus
 	b, _ := json.Marshal(body)
 	if json.Unmarshal(b, &st) != nil || st.Status == "" {
-		logger.Info("[Checkin] daily-check-in/status bad body, fallback: %s", truncate(raw, 200))
-		return *res, false
+		return
 	}
+	logger.Info("[Checkin] daily-check-in(status only) state=%s key=%s streak=%d",
+		st.Status, st.CampaignKey, st.CurrentStreakDays)
 
-	// 无论后续领取结果如何，先保存统计字段
-	res.StreakDays = st.CurrentStreakDays
-	res.TotalClaimDays = st.TotalClaimDays
-	res.TotalRewardCredits = st.TotalRewardCredits
-	res.RewardCredits = st.RewardCredits
-	logger.Info("[Checkin] daily-check-in status=%s key=%s streak=%d totalDays=%d",
-		st.Status, st.CampaignKey, st.CurrentStreakDays, st.TotalClaimDays)
-
-	// Step 2: 幂等领取（status=CLAIMED 时也直接 claim，靠 409 判定已领）
-	status, body, raw = doCheckinRequest("POST", "/sash/api/v1/me/daily-check-in/claim", deviceToken, map[string]interface{}{})
-
-	// 409 AlreadyExists = 今日已领取（与 campaigns 领取状态共享）
-	if status == 409 {
-		res.Status = checkinStatusAlreadyClaimed
-		res.Message = "今日已领取"
-		return *res, true
+	// 仅当 legacy 返回非 0 统计时才补充（DISABLED 时恒 0，不覆盖本地数据）
+	if st.CurrentStreakDays > 0 || st.TotalClaimDays > 0 {
+		if st.CurrentStreakDays > res.StreakDays {
+			res.StreakDays = st.CurrentStreakDays
+		}
+		if st.TotalClaimDays > res.TotalClaimDays {
+			res.TotalClaimDays = st.TotalClaimDays
+		}
+		if st.TotalRewardCredits > res.TotalRewardCredits {
+			res.TotalRewardCredits = st.TotalRewardCredits
+		}
 	}
-
-	// 领取成功
-	if status == 200 {
-		var claimResp struct {
-			Success       bool `json:"success"`
-			RewardCredits int  `json:"rewardCredits"`
-		}
-		b, _ = json.Marshal(body)
-		_ = json.Unmarshal(b, &claimResp)
-
-		res.Status = checkinStatusClaimed
-		amount := claimResp.RewardCredits
-		if amount == 0 {
-			amount = res.RewardCredits
-		}
-		if amount == 0 {
-			amount = 100 // 活动默认 100
-		}
-		res.Amount = amount
-		res.StreakDays++
-		res.TotalClaimDays++
-		res.TotalRewardCredits += amount
-		res.Message = fmt.Sprintf("签到成功 +%d", amount)
-		return *res, true
+	if res.RewardCredits == 0 && st.RewardCredits > 0 {
+		res.RewardCredits = st.RewardCredits
 	}
-
-	// 其他错误（如 legacy DISABLED 拒绝）→ 回退 campaigns（统计字段已保留在 res 上）
-	logger.Info("[Checkin] daily-check-in/claim HTTP %d, fallback to campaigns: %s", status, truncate(raw, 200))
-	return *res, false
 }
 
 // streakSuffix 在消息后追加连续签到统计（无统计时不追加）
