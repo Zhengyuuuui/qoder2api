@@ -28,11 +28,15 @@ type CheckinResult struct {
 	ExpiresAt string `json:"expires_at,omitempty"`
 	Message   string `json:"message"`
 
-	// 签到统计（来自 daily-check-in/status）
+	// 签到统计（来自 daily-check-in/status 或本地历史）
 	StreakDays         int `json:"streak_days,omitempty"`          // 连续签到天数
 	TotalClaimDays     int `json:"total_claim_days,omitempty"`     // 累计签到天数
 	TotalRewardCredits int `json:"total_reward_credits,omitempty"` // 累计奖励积分
 	RewardCredits      int `json:"reward_credits,omitempty"`       // 每日签到奖励额
+
+	// WindowDate 本次领取对应的活动窗口日期（YYYY-MM-DD），用于本地历史记录。
+	// 用窗口日期而非自然日，避免 10:00 前把「昨天的窗口」误记到今天。
+	WindowDate string `json:"-"`
 }
 
 const (
@@ -109,6 +113,8 @@ type campaignInfo struct {
 	CampaignKey string `json:"campaignKey"`
 	ActionType  string `json:"actionType"`
 	ClaimStatus string `json:"claimStatus"`
+	StartAt     int64  `json:"startAt"` // 窗口开始时间（Unix 秒）
+	EndAt       int64  `json:"endAt"`
 	Benefit     *struct {
 		Kind   string `json:"kind"`
 		Amount int    `json:"amount"`
@@ -203,30 +209,29 @@ func calcLocalStats(recs []checkinRecord) (streak, totalDays, totalCredits int) 
 	return streak, totalDays, totalCredits
 }
 
-// recordCheckinToday 记录该账号今日签到（同日幂等），返回本地统计
-func recordCheckinToday(accountID string, amount int) (streak, totalDays, totalCredits int) {
+// recordCheckinOn 记录该账号某日期签到（同日幂等），返回本地统计
+func recordCheckinOn(accountID, date string, amount int) (streak, totalDays, totalCredits int) {
 	historyMu.Lock()
 	defer historyMu.Unlock()
 
 	h := loadCheckinHistory()
 	recs := h.Accounts[accountID]
-	today := time.Now().Format("2006-01-02")
 
 	found := false
 	for _, r := range recs {
-		if r.Date == today {
+		if r.Date == date {
 			found = true
 			break
 		}
 	}
 	if !found {
-		recs = append(recs, checkinRecord{Date: today, Amount: amount})
+		recs = append(recs, checkinRecord{Date: date, Amount: amount})
 		h.Accounts[accountID] = recs
 		saveCheckinHistory(h)
 	} else if amount > 0 {
-		// 今日已有记录但金额为 0（早前版本记录）→ 补记金额
+		// 已有记录但金额为 0（早前版本记录）→ 补记金额
 		for i := range recs {
-			if recs[i].Date == today && recs[i].Amount == 0 {
+			if recs[i].Date == date && recs[i].Amount == 0 {
 				recs[i].Amount = amount
 				h.Accounts[accountID] = recs
 				saveCheckinHistory(h)
@@ -245,10 +250,14 @@ func localCheckinStats(accountID string) (streak, totalDays, totalCredits int) {
 }
 
 // applyLocalStreak 用本地签到历史覆盖统计字段（本地数据比上游 legacy 更可信）
-func applyLocalStreak(accountID string, res *CheckinResult, recordToday bool, amount int) {
+// record=true 时按 date 记录（date 空则用今天）；本地有记录时以本地为准
+func applyLocalStreak(accountID string, res *CheckinResult, record bool, date string, amount int) {
 	var streak, totalDays, totalCredits int
-	if recordToday {
-		streak, totalDays, totalCredits = recordCheckinToday(accountID, amount)
+	if record {
+		if date == "" {
+			date = time.Now().Format("2006-01-02")
+		}
+		streak, totalDays, totalCredits = recordCheckinOn(accountID, date, amount)
 	} else {
 		streak, totalDays, totalCredits = localCheckinStats(accountID)
 	}
@@ -318,7 +327,7 @@ func finalizeCheckin(accountID string, r CheckinResult) CheckinResult {
 		amount = 100
 	}
 
-	applyLocalStreak(accountID, &r, record, amount)
+	applyLocalStreak(accountID, &r, record, r.WindowDate, amount)
 	// 领取类结果统一追加统计后缀（applyLocalStreak 已更新统计）
 	if record || r.StreakDays > 0 || r.TotalClaimDays > 0 {
 		r.Message = r.Message + streakSuffix(&r, "")
@@ -379,6 +388,23 @@ func streakSuffix(res *CheckinResult, prefix string) string {
 	return s
 }
 
+// windowHint 生成更准确的"已领取"提示
+// 若当前窗口是上一日开的（10:00 前点击），明确告知新窗口开放时间，避免误以为没领到
+func windowHint(res *CheckinResult, fallback string) string {
+	if res.WindowDate == "" {
+		return fallback
+	}
+	today := time.Now().Format("2006-01-02")
+	if res.WindowDate == today {
+		return fallback
+	}
+	if wd, err := time.Parse("2006-01-02", res.WindowDate); err == nil {
+		next := wd.AddDate(0, 0, 1).Format("01-02")
+		return fmt.Sprintf("已领取 %s 窗口额度（新窗口 %s 10:00 开放）", res.WindowDate, next)
+	}
+	return fallback
+}
+
 // campaignsCheckin 兜底：走桌面端抓包还原的 campaigns 流程
 func campaignsCheckin(deviceToken string, res *CheckinResult) CheckinResult {
 	// Step 1: 查询活动列表
@@ -405,14 +431,16 @@ func campaignsCheckin(deviceToken string, res *CheckinResult) CheckinResult {
 		}
 	}
 
-	// 找可领取的 CLAIM_BENEFIT 活动
+	// 找可领取的 CLAIM_BENEFIT 活动，并记录窗口开始时间（用于本地历史日期）
 	var target *campaignInfo
+	var benefitCampaign *campaignInfo
 	alreadyClaimed := false
 	for i := range campaigns {
 		c := &campaigns[i]
 		if c.ActionType != "CLAIM_BENEFIT" {
 			continue
 		}
+		benefitCampaign = c // 任意状态，用于取窗口日期
 		if c.ClaimStatus == "CLAIMABLE" {
 			target = c
 		} else if c.ClaimStatus == "CLAIMED" {
@@ -420,10 +448,20 @@ func campaignsCheckin(deviceToken string, res *CheckinResult) CheckinResult {
 		}
 	}
 
+	// 窗口日期：取 CLAIM_BENEFIT 活动的 startAt（本地时区）。
+	// 每日窗口 10:00→次日 10:00，用窗口日期避免 10:00 前把昨日窗口误记到今天。
+	windowSrc := target
+	if windowSrc == nil {
+		windowSrc = benefitCampaign
+	}
+	if windowSrc != nil && windowSrc.StartAt > 0 {
+		res.WindowDate = time.Unix(windowSrc.StartAt, 0).Format("2006-01-02")
+	}
+
 	if target == nil {
 		if alreadyClaimed {
 			res.Status = checkinStatusAlreadyClaimed
-			res.Message = "今日已领取"
+			res.Message = windowHint(res, "今日已领取")
 		} else {
 			res.Status = checkinStatusNoCampaign
 			res.Message = "无可用签到活动"
@@ -449,7 +487,7 @@ func campaignsCheckin(deviceToken string, res *CheckinResult) CheckinResult {
 	if cr.Status == "CLAIMED" {
 		if cr.Replayed {
 			res.Status = checkinStatusAlreadyClaimed
-			res.Message = "今日已领取（幂等返回）"
+			res.Message = windowHint(res, "今日已领取")
 		} else {
 			res.Status = checkinStatusClaimed
 			if cr.Benefit != nil {
@@ -608,16 +646,31 @@ func runScheduledCheckin() bool {
 	if lastCheckinDay == today {
 		return false
 	}
-	lastCheckinDay = today
 
 	logger.Info("[Checkin] auto checkin triggered at %s", now.Format("15:04:05"))
 	results := CheckinAll()
-	claimed := 0
+
+	claimed, already, retryable := 0, 0, 0
 	for _, r := range results {
-		if r.Status == checkinStatusClaimed {
+		switch r.Status {
+		case checkinStatusClaimed:
 			claimed++
+		case checkinStatusAlreadyClaimed:
+			already++
+		case checkinStatusError, checkinStatusNoCampaign, checkinStatusNoToken:
+			// 可能活动尚未创建（10:00 整点服务器有延迟）→ 允许重试
+			retryable++
 		}
 	}
-	logger.Info("[Checkin] auto checkin done: %d claimed, total %d accounts", claimed, len(results))
+
+	// 标记当日完成的条件：无可重试状态；或已过 12:00（兜底不再重试，避免无限轮询）
+	if retryable == 0 || now.Hour() >= 12 {
+		lastCheckinDay = today
+		logger.Info("[Checkin] auto checkin finished: %d claimed, %d already, %d retryable, total %d",
+			claimed, already, retryable, len(results))
+	} else {
+		logger.Info("[Checkin] auto checkin partial: %d claimed, %d already, %d retryable -> will retry next tick",
+			claimed, already, retryable)
+	}
 	return true
 }
