@@ -76,6 +76,8 @@ type Bridge struct {
 	client       *BearerClient
 	region       account.Region
 	templateBase map[string]interface{}
+	// pool 非空时启用多账号轮询 + 失败换号；为空则退化为单账号（sess/client/region）。
+	pool *Pool
 	// chatStreamURL 测试注入用：非空时覆盖 region 对应的上游 chat 流地址
 	chatStreamURL string
 }
@@ -174,8 +176,12 @@ func NewBridge(pat string, region account.Region, templateBase map[string]interf
 // ListAvailableModels 通过 cosy 签名调用 /algo/api/v2/model/list 拉取上游模型清单。
 // 返回顶层 assistant 数组中 enable=true 的模型，按 is_default desc + display_name asc 排序。
 func (b *Bridge) ListAvailableModels() ([]QoderModel, error) {
-	modelListURL := qoderModelListURL(b.region)
-	resp, err := b.client.callGet(modelListURL)
+	slot, ok := b.pickSlot(nil)
+	if !ok {
+		return nil, ErrNoAccount
+	}
+	modelListURL := qoderModelListURL(slot.Region)
+	resp, err := slot.client.callGet(modelListURL)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +190,7 @@ func (b *Bridge) ListAvailableModels() ([]QoderModel, error) {
 	for k := range resp {
 		keys = append(keys, k)
 	}
-	logger.Info("model list response keys: %v (region=%s)", keys, b.region)
+	logger.Info("model list response keys: %v (region=%s)", keys, slot.Region)
 	models := parseQoderModels(resp)
 	if len(models) == 0 {
 		return nil, fmt.Errorf("%s -> empty model list, keys=%v", modelListURL, keys)
@@ -322,13 +328,7 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	}
 	body := DeepCopyMap(b.templateBase)
 
-	nid := cosy.NewUUID()
-	body["request_id"] = nid
-	body["chat_record_id"] = nid
-	body["request_set_id"] = cosy.NewUUID()
-	body["session_id"] = cosy.NewUUID()
 	body["stream"] = true
-	body["aliyun_user_type"] = b.sess.Identity.UserType
 
 	if mc, ok := body["model_config"].(map[string]interface{}); ok {
 		mc["key"] = model
@@ -397,38 +397,78 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		}
 	}
 
-	qurl := qoderChatStreamURL(b.region)
-	if b.chatStreamURL != "" {
-		qurl = b.chatStreamURL
-	}
 	extra := map[string]string{
 		"x-model-key":    model,
 		"x-model-source": mcSource,
 	}
 
 	preview := prompt
-	if len(preview) > 80 {
+	if len(prompt) > 80 {
 		preview = preview[:80] + "..."
 	}
 	logger.Info("callQoder model=%s prompt=%s", model, preview)
-	logger.Debug("callQoder request body: %s", func() string { d, _ := json.Marshal(body); return string(d) }())
 
-	// ---- SSE 信封重试闸门（第 3 步，参照 hub should_retry_envelope /
-	// aggregate_with_envelope_retry）------------------------------------------
-	// 关键形态：上游 HTTP200 建流后才在信封里投 418/5xx，连接层重试覆盖不到。
-	// 闸门规则：只要「尚未向 onDelta 发出任何非空 delta」且错误属瞬时类
-	// （信封 418/5xx/provider_error、传输层 TLS EOF 等），就重开上游重试，
-	// 对调用方无感；已发出内容则直接上抛，避免客户端收到重复内容。
-	// 客户端参数错 / 内容审核 / 401/429 经 IsTransientUpstream 判定为
-	// 不可重试，快速失败。闸门做在此处，chat/claude/codex 三协议的
-	// 流式与非流式路径全部自动覆盖。
-	// 说明：连接阶段错误已在 openStreamLines 内部重试过；此处重开是
-	// 第二层防护（有界：最多 TransientMaxRetries 次），主要覆盖流内信封错误。
+	// ---- 账号池选号 + 失败换号 -------------------------------------------
+	// 逐个尝试池内账号：某账号失败且「尚未向客户端发出任何内容」、且错误属于
+	// 可换号类（额度/频控/瞬时），就冷却该账号并换下一个；已发出内容或
+	// 客户端参数错/内容审核则立即上抛——避免重复内容、避免无意义换号。
+	tried := make(map[string]struct{})
 	var lastErr error
+	for {
+		slot, ok := b.pickSlotForModel(model, tried)
+		if !ok {
+			break
+		}
+		logger.Info("callQoder: using account %s (%s)", slot.Name, slot.ID)
+		// 每个账号用全新的请求 id / session，避免跨账号复用同一标识
+		nid := cosy.NewUUID()
+		body["request_id"] = nid
+		body["chat_record_id"] = nid
+		body["request_set_id"] = cosy.NewUUID()
+		body["session_id"] = cosy.NewUUID()
+		body["aliyun_user_type"] = slot.sess.Identity.UserType
+		if biz, ok := body["business"].(map[string]interface{}); ok {
+			biz["id"] = cosy.NewUUID()
+			biz["begin_at"] = cosy.UnixMs()
+		}
+
+		qurl := b.chatStreamURL
+		if qurl == "" {
+			qurl = qoderChatStreamURL(slot.Region)
+		}
+		logger.Debug("callQoder request body: %s", func() string { d, _ := json.Marshal(body); return string(d) }())
+
+		emitted, err := b.streamWithSlot(ctx, slot, qurl, body, extra, onDelta)
+		if err == nil {
+			b.noteSlotSuccess(slot.ID)
+			return nil
+		}
+		lastErr = err
+		if emitted || !ShouldFailover(err) {
+			return err
+		}
+		b.coolSlot(slot.ID, CooldownFor(err), err.Error())
+		tried[slot.ID] = struct{}{}
+		logger.Info("callQoder: account %s failed, failing over to next account: %v", slot.ID, err)
+	}
+	if lastErr == nil {
+		lastErr = ErrNoAccount
+	}
+	return lastErr
+}
+
+// streamWithSlot 在单个账号上执行「SSE 信封重试闸门」。
+// 连接阶段错误已由 openStreamLines 内部重试；此处是第二层防护（有界：
+// 最多 TransientMaxRetries 次），主要覆盖上游 HTTP200 建流后才在信封里
+// 投递 418/5xx 的形态。返回是否已向 onDelta 发出过内容——上层据此决定
+// 能否换号（已发出内容则不能，否则客户端会收到重复内容）。
+func (b *Bridge) streamWithSlot(ctx context.Context, slot *Slot, qurl string, body map[string]interface{}, extra map[string]string, onDelta func(Delta)) (bool, error) {
+	var lastErr error
+	emittedAny := false
 	for attempt := 0; attempt <= TransientMaxRetries; attempt++ {
 		if attempt > 0 {
 			if serr := sleepCtx(ctx, RetryBackoff(attempt)); serr != nil {
-				return lastErr
+				return emittedAny, lastErr
 			}
 			logger.Info("reopen upstream after in-stream error (try %d/%d): %v",
 				attempt+1, TransientMaxRetries+1, lastErr)
@@ -438,19 +478,19 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		onDeltaWrapped := func(d Delta) {
 			if !d.isEmpty() {
 				emitted = true
+				emittedAny = true
 			}
 			onDelta(d)
 		}
-		streamErr := b.client.openStreamLines(ctx, qurl, body, extra,
+		streamErr := slot.client.openStreamLines(ctx, qurl, body, extra,
 			deltaDispatcher(onDeltaWrapped, &upstreamErr))
 		if upstreamErr == nil && streamErr == nil {
 			// 上游正常关流但未发出任何有效 delta/usage 帧：对齐 hub
-			// "empty upstream stream" 显式报错（不纳入重开闸门——
-			// isRetryableStreamError 对哨兵错误自然返回 false，不重试）
+			// "empty upstream stream" 显式报错（不纳入重开闸门）。
 			if !emitted {
-				return ErrEmptyStream
+				return emittedAny, ErrEmptyStream
 			}
-			return nil
+			return emittedAny, nil
 		}
 		if upstreamErr != nil {
 			lastErr = upstreamErr
@@ -458,10 +498,10 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 			lastErr = streamErr
 		}
 		if emitted || attempt >= TransientMaxRetries || !isRetryableStreamError(lastErr) {
-			return lastErr
+			return emittedAny, lastErr
 		}
 	}
-	return lastErr
+	return emittedAny, lastErr
 }
 
 // isRetryableStreamError 判定流内/连接错误是否值得重开上游：

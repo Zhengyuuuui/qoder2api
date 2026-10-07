@@ -23,6 +23,8 @@ const (
 	ErrTypeContentPolicy = "content_policy_rejected"
 	ErrTypeTransient     = "upstream_transient_error"
 	ErrTypeUpstream      = "upstream_error"
+	// ErrTypeNoAccount 账号池全部处于冷却（额度/频控/故障），请求无法分配账号。
+	ErrTypeNoAccount = "no_available_account"
 )
 
 // TransientMaxRetries 同账号瞬时故障额外重试次数（退避时长见 RetryBackoff）。
@@ -216,6 +218,9 @@ func FriendlyError(err error) (string, string) {
 	if err == nil {
 		return "", ""
 	}
+	if errors.Is(err, ErrNoAccount) {
+		return "所有账号当前均不可用（额度 / 频控 / 故障冷却中），请稍后重试", ErrTypeNoAccount
+	}
 	var ue *UpstreamError
 	if errors.As(err, &ue) {
 		return ue.Message, ue.ErrType
@@ -226,9 +231,13 @@ func FriendlyError(err error) (string, string) {
 // ErrorStatus 取错误对应的 HTTP 状态。分类映射优先于上游状态透传：
 //   - 内容审核拒绝 → 400（用户输入问题，客户端应改输入而非重试）
 //   - 瞬时故障耗尽 → 502（不透传上游包装的 418 等无意义状态码）
+//   - 账号池全冷却 → 503（服务暂时不可用，客户端应稍后重试）
 //   - 其余结构化错误 → 透传上游合法 4xx/5xx
 //   - 无结构化状态 → 500
 func ErrorStatus(err error) int {
+	if errors.Is(err, ErrNoAccount) {
+		return 503
+	}
 	var ue *UpstreamError
 	if errors.As(err, &ue) {
 		switch ue.ErrType {

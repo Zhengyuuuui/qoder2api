@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ type QoderModel struct {
 
 type Service struct {
 	bridge      *bridge.Bridge
+	pool        *bridge.Pool
 	bridgeSrv   *http.Server
 	bridgeMu    sync.Mutex
 	bridgePort  int
@@ -180,6 +182,7 @@ func (s *Service) StopBridge() error {
 	err := s.bridgeSrv.Close()
 	s.bridgeSrv = nil
 	s.bridge = nil
+	s.pool = nil
 	return err
 }
 
@@ -219,12 +222,6 @@ func (s *Service) authMiddleware(next http.Handler) http.Handler {
 }
 
 func (s *Service) startBridgeWithAccount(acct *account.Account) error {
-	logger.Info("startBridgeWithAccount: account=%s", acct.Name)
-	pat, err := account.GetSecret(acct.ID)
-	if err != nil {
-		return fmt.Errorf("failed to get secret: %w", err)
-	}
-
 	tmpl := string(s.basePrompt)
 	for _, ukey := range []string{"{UUID1}", "{UUID2}", "{UUID3}", "{UUID4}", "{UUID5}"} {
 		tmpl = strings.ReplaceAll(tmpl, ukey, cosy.NewUUID())
@@ -233,10 +230,15 @@ func (s *Service) startBridgeWithAccount(acct *account.Account) error {
 	var templateBase map[string]interface{}
 	_ = json.Unmarshal([]byte(tmpl), &templateBase)
 
-	b, err := bridge.NewBridge(pat, acct.Region, templateBase)
-	if err != nil {
-		return fmt.Errorf("failed to create bridge: %w", err)
+	// 账号池：把所有有凭证的账号都纳入。请求时轮询选号，某个账号限额/限流/
+	// 瞬时故障时冷却该账号并自动换下一个（见 internal/bridge/pool.go）。
+	pool := s.buildAccountPool()
+	if pool.Size() == 0 {
+		return fmt.Errorf("no account with usable secret; please OAuth/PAT login in web console")
 	}
+	logger.Info("startBridgeWithAccount: pool size=%d (requested active=%s)", pool.Size(), acct.Name)
+
+	b := bridge.NewPoolBridge(pool, templateBase)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", b.HandleChatCompletions)
@@ -254,6 +256,7 @@ func (s *Service) startBridgeWithAccount(acct *account.Account) error {
 
 	s.bridgeMu.Lock()
 	s.bridge = b
+	s.pool = pool
 	s.bridgeSrv = srv
 	s.bridgeMu.Unlock()
 
@@ -263,6 +266,69 @@ func (s *Service) startBridgeWithAccount(acct *account.Account) error {
 			logger.Error("bridge serve error: %v", err)
 		}
 	}()
+	return nil
+}
+
+// buildAccountPool 把所有有 secret 的账号建成运行时账号池。
+// 单个账号建会话失败（凭证失效/网络等）只跳过该账号，不阻断整池启动。
+func (s *Service) buildAccountPool() *bridge.Pool {
+	pool := bridge.NewPoolWithState(filepath.Join(account.DataRoot(), "pool_state.json"))
+	accounts, err := account.List()
+	if err != nil {
+		logger.Error("buildAccountPool: list accounts: %v", err)
+		return pool
+	}
+	for _, a := range accounts {
+		if !account.HasSecret(a.ID) {
+			continue
+		}
+		pat, err := account.GetSecret(a.ID)
+		if err != nil {
+			logger.Error("buildAccountPool: get secret for %s: %v", a.Name, err)
+			continue
+		}
+		slot, err := bridge.NewSlotFromSecret(a.ID, a.Name, a.Region, pat)
+		if err != nil {
+			logger.Error("buildAccountPool: account %s unusable, skipped: %v", a.Name, err)
+			continue
+		}
+		pool.Add(slot)
+		logger.Info("buildAccountPool: added account %s (region=%s)", a.Name, a.Region)
+	}
+	// 账号全部入池后再恢复冷却状态（构造时空池 load 匹配不到 ID）。
+	pool.LoadState()
+	return pool
+}
+
+// PoolStatus 返回账号池运行时状态（桥未启动时为空）。
+func (s *Service) PoolStatus() []bridge.SlotStatus {
+	s.bridgeMu.Lock()
+	pool := s.pool
+	s.bridgeMu.Unlock()
+	if pool == nil {
+		return nil
+	}
+	return pool.Status()
+}
+
+// CoolAccount 手动冷却指定账号（运维/调试用，便于观察选号与换号）。
+func (s *Service) CoolAccount(id string, seconds int, reason string) error {
+	s.bridgeMu.Lock()
+	pool := s.pool
+	s.bridgeMu.Unlock()
+	if pool == nil {
+		return fmt.Errorf("bridge not running")
+	}
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("id required")
+	}
+	if seconds <= 0 {
+		seconds = 60
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "manual cooldown"
+	}
+	pool.Cool(id, time.Duration(seconds)*time.Second, reason)
 	return nil
 }
 

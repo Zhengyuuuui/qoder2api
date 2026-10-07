@@ -127,6 +127,8 @@ func main() {
 	mux.HandleFunc("/api/oauth/wait", handleOAuthWait)
 	mux.HandleFunc("/api/oauth/cancel", handleOAuthCancel)
 	mux.HandleFunc("/api/active", handleSetActiveAccount)
+	mux.HandleFunc("/api/pool", handlePoolStatus)
+	mux.HandleFunc("/api/pool/cool", handlePoolCool)
 	mux.HandleFunc("/api/settings", handleGetSettings)
 	mux.HandleFunc("/api/settings/save", handleSaveSettings)
 	mux.HandleFunc("/api/models", handleListModels)
@@ -389,6 +391,31 @@ func handleSetActiveAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func handlePoolStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{"slots": svc.PoolStatus()})
+}
+
+func handlePoolCool(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	var req struct {
+		ID      string `json:"id"`
+		Seconds int    `json:"seconds"`
+		Reason  string `json:"reason"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := svc.CoolAccount(req.ID, req.Seconds, req.Reason); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	settings, err := svc.GetSettings()
 	if err != nil {
@@ -418,12 +445,13 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Port            *int    `json:"port"`
-		BridgeToken     *string `json:"bridge_token"`
-		LogLevel        *string `json:"log_level"`
-		AutoStart       *bool   `json:"auto_start"`
-		AutoCheckin     *bool   `json:"auto_checkin"`
-		ConsolePassword *string `json:"console_password"`
+		Port             *int     `json:"port"`
+		BridgeToken      *string  `json:"bridge_token"`
+		LogLevel         *string  `json:"log_level"`
+		AutoStart        *bool    `json:"auto_start"`
+		AutoCheckin      *bool    `json:"auto_checkin"`
+		AutoCheckinTimes []string `json:"auto_checkin_times"`
+		ConsolePassword  *string  `json:"console_password"`
 		// 新格式：包含旧密码和新密码
 		ConsolePasswordNew *struct {
 			OldPassword string  `json:"old_password"`
@@ -462,6 +490,22 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	if req.AutoCheckin != nil {
 		cur.AutoCheckin = *req.AutoCheckin
 		logger.Info("auto checkin set to %v", cur.AutoCheckin)
+	}
+	if req.AutoCheckinTimes != nil {
+		var times []string
+		for _, t := range req.AutoCheckinTimes {
+			t = strings.TrimSpace(t)
+			if t == "" {
+				continue
+			}
+			if _, _, ok := parseHHMM(t); !ok {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("invalid auto_checkin_times entry: %q (want HH:MM)", t))
+				return
+			}
+			times = append(times, t)
+		}
+		cur.AutoCheckinTimes = times
+		logger.Info("auto checkin times set to %v", times)
 	}
 
 	// 处理新格式的密码修改

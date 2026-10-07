@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,8 +18,18 @@ import (
 	"qoder2api/logger"
 )
 
-// checkinHost 是签到 API 域名（抓包确认为 openapi.qoder.com.cn）
+// checkinHost 是签到 API 的兜底域名（国内）。国际走 openapi.qoder.sh，
+// 由 checkinHostFor 按账号区域选择——此前写死国内域名导致国际号签到
+// 返回 401 TOKEN_EXPIRE（拿国际 token 打国内端点）。
 const checkinHost = "openapi.qoder.com.cn"
+
+// checkinHostFor 返回该区域的签到/OpenAPI 主机。
+func checkinHostFor(region account.Region) string {
+	if h := account.GetEndpoints(region).OpenAPIHost; h != "" {
+		return h
+	}
+	return checkinHost
+}
 
 // CheckinResult 单个账号的签到结果
 type CheckinResult struct {
@@ -68,8 +80,11 @@ func checkinHeaders(deviceToken string) map[string]string {
 
 // doCheckinRequest 发送签到相关请求，返回 (httpStatus, parsedJSON, rawBody)
 // reqBody 为 nil 时发送空 body（抓包确认 campaigns/claim 即为空 body）
-func doCheckinRequest(method, path, deviceToken string, reqBody interface{}) (int, interface{}, string) {
-	url := "https://" + checkinHost + path
+func doCheckinRequest(method, path, deviceToken string, reqBody interface{}, host string) (int, interface{}, string) {
+	if host == "" {
+		host = checkinHost
+	}
+	url := "https://" + host + path
 
 	var body io.Reader
 	var bodyBytes []byte
@@ -85,7 +100,7 @@ func doCheckinRequest(method, path, deviceToken string, reqBody interface{}) (in
 		req.Header.Set(k, v)
 	}
 	if method == "POST" {
-		req.Header.Set("origin", "https://"+checkinHost)
+		req.Header.Set("origin", "https://"+host)
 		if reqBody == nil {
 			req.ContentLength = 0 // 抓包确认 claim 无 body
 		}
@@ -305,10 +320,11 @@ func checkinAccount(acct *account.Account) CheckinResult {
 	// ========== 权威领取：campaigns 流程（真实发放积分的系统） ==========
 	// 注意：不走 daily-check-in/claim —— 该 legacy 端点已 DISABLED，
 	// 却对未领取日也恒返回 409，会误判"已领取"导致跳过真实领取（实测 2026-09-21 不发积分）
-	r := campaignsCheckin(deviceToken, &res)
+	host := checkinHostFor(acct.Region)
+	r := campaignsCheckin(deviceToken, &res, host)
 
 	// 只读补充 legacy 统计（DISABLED 时恒 0，不影响结果；上游恢复后可提供 streak）
-	readDailyCheckinStats(deviceToken, &r)
+	readDailyCheckinStats(deviceToken, &r, host)
 
 	return finalizeCheckin(acct.ID, r)
 }
@@ -339,8 +355,8 @@ func finalizeCheckin(accountID string, r CheckinResult) CheckinResult {
 // 背景：该端点的 legacy 活动已 DISABLED，claim 会恒返回 409 造成误判，
 // 且不发放任何积分（2026-09-21 实测）。真实领取只走 campaigns 流程。
 // 上游恢复后若返回非 0 统计，可作为 streak 的补充数据源。
-func readDailyCheckinStats(deviceToken string, res *CheckinResult) {
-	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/daily-check-in/status", deviceToken, nil)
+func readDailyCheckinStats(deviceToken string, res *CheckinResult, host string) {
+	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/daily-check-in/status", deviceToken, nil, host)
 	if status != 200 {
 		if status != 404 && status != 401 {
 			logger.Info("[Checkin] daily-check-in/status HTTP %d: %s", status, truncate(raw, 150))
@@ -406,9 +422,9 @@ func windowHint(res *CheckinResult, fallback string) string {
 }
 
 // campaignsCheckin 兜底：走桌面端抓包还原的 campaigns 流程
-func campaignsCheckin(deviceToken string, res *CheckinResult) CheckinResult {
+func campaignsCheckin(deviceToken string, res *CheckinResult, host string) CheckinResult {
 	// Step 1: 查询活动列表
-	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/campaigns", deviceToken, nil)
+	status, body, raw := doCheckinRequest("GET", "/sash/api/v1/me/campaigns", deviceToken, nil, host)
 	if status != 200 {
 		res.Message = fmt.Sprintf("查询活动失败 HTTP %d: %s", status, truncate(raw, 300))
 		return *res
@@ -471,7 +487,7 @@ func campaignsCheckin(deviceToken string, res *CheckinResult) CheckinResult {
 
 	// Step 2: 领取（空 body，抓包确认）
 	claimPath := fmt.Sprintf("/sash/api/v1/me/campaigns/%s/claim", target.CampaignID)
-	status, body, raw = doCheckinRequest("POST", claimPath, deviceToken, nil)
+	status, body, raw = doCheckinRequest("POST", claimPath, deviceToken, nil, host)
 	if status != 200 {
 		res.Message = fmt.Sprintf("领取失败 HTTP %d: %s", status, truncate(raw, 300))
 		return *res
@@ -600,15 +616,40 @@ func handleCheckin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---------- 每日 10:00 自动签到调度 ----------
+// ---------- 每日自动签到调度 ----------
 
 var (
-	checkinMu      sync.Mutex
-	lastCheckinDay string // 最近一次自动签到的日期 (YYYY-MM-DD)，防止同日重复
+	checkinMu   sync.Mutex
+	checkinDone = map[string]bool{} // key: "YYYY-MM-DD HH:MM"，当日该时段已执行
 )
 
-// StartCheckinScheduler 启动后台调度器（非阻塞）
-// 每分钟检查一次：若开关开启且当前时间 >= 当日 10:00 且当日未执行，则自动签到
+// defaultCheckinTimes 未配置时的默认签到时间（保持原行为）。
+var defaultCheckinTimes = []string{"10:00"}
+
+// CheckinTimes 返回生效的自动签到时间列表（HH:MM）。
+func CheckinTimes(settings *account.Settings) []string {
+	if settings != nil && len(settings.AutoCheckinTimes) > 0 {
+		return settings.AutoCheckinTimes
+	}
+	return defaultCheckinTimes
+}
+
+// parseHHMM 解析 "09:15" → (9, 15, true)
+func parseHHMM(s string) (int, int, bool) {
+	parts := strings.Split(strings.TrimSpace(s), ":")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	m, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, 0, false
+	}
+	return h, m, true
+}
+
+// StartCheckinScheduler 启动后台调度器（非阻塞）。每分钟检查一次：对每个配置的
+// 时间点，若开关开启、当前已过该点、且当日该点尚未执行，则自动签到。
 func StartCheckinScheduler() {
 	go func() {
 		ticker := time.NewTicker(time.Minute)
@@ -617,60 +658,63 @@ func StartCheckinScheduler() {
 			runScheduledCheckin()
 		}
 	}()
-	logger.Info("auto checkin scheduler started (daily 10:00, default off)")
+	logger.Info("auto checkin scheduler started (times=%s, default off)", strings.Join(CheckinTimes(nil), ","))
 }
 
-// runScheduledCheckin 执行一次调度检查（可手动调用测试）
+// runScheduledCheckin 执行一次调度检查（可手动调用测试）。
 func runScheduledCheckin() bool {
-	// 读取开关（默认关闭）
 	settings, err := account.LoadSettings()
-	if err != nil || settings == nil {
+	if err != nil || settings == nil || !settings.AutoCheckin {
 		return false
 	}
-	if !settings.AutoCheckin {
-		return false
-	}
-
 	now := time.Now()
-	today := now.Format("2006-01-02")
+	date := now.Format("2006-01-02")
+	nowMin := now.Hour()*60 + now.Minute()
 
-	// 必须已过 10:00
-	if now.Hour() < 10 {
-		return false
-	}
-
-	checkinMu.Lock()
-	defer checkinMu.Unlock()
-
-	// 当日已执行过
-	if lastCheckinDay == today {
-		return false
-	}
-
-	logger.Info("[Checkin] auto checkin triggered at %s", now.Format("15:04:05"))
-	results := CheckinAll()
-
-	claimed, already, retryable := 0, 0, 0
-	for _, r := range results {
-		switch r.Status {
-		case checkinStatusClaimed:
-			claimed++
-		case checkinStatusAlreadyClaimed:
-			already++
-		case checkinStatusError, checkinStatusNoCampaign, checkinStatusNoToken:
-			// 可能活动尚未创建（10:00 整点服务器有延迟）→ 允许重试
-			retryable++
+	ran := false
+	for _, t := range CheckinTimes(settings) {
+		h, m, ok := parseHHMM(t)
+		if !ok {
+			logger.Error("[Checkin] invalid auto checkin time %q, skipped", t)
+			continue
 		}
-	}
+		slotMin := h*60 + m
+		if nowMin < slotMin {
+			continue // 还没到点
+		}
+		key := date + " " + t
+		checkinMu.Lock()
+		done := checkinDone[key]
+		checkinMu.Unlock()
+		if done {
+			continue
+		}
 
-	// 标记当日完成的条件：无可重试状态；或已过 12:00（兜底不再重试，避免无限轮询）
-	if retryable == 0 || now.Hour() >= 12 {
-		lastCheckinDay = today
-		logger.Info("[Checkin] auto checkin finished: %d claimed, %d already, %d retryable, total %d",
-			claimed, already, retryable, len(results))
-	} else {
-		logger.Info("[Checkin] auto checkin partial: %d claimed, %d already, %d retryable -> will retry next tick",
-			claimed, already, retryable)
+		logger.Info("[Checkin] auto checkin triggered at %s (slot %s)", now.Format("15:04:05"), t)
+		results := CheckinAll()
+		claimed, already, retryable := 0, 0, 0
+		for _, r := range results {
+			switch r.Status {
+			case checkinStatusClaimed:
+				claimed++
+			case checkinStatusAlreadyClaimed:
+				already++
+			case checkinStatusError, checkinStatusNoCampaign, checkinStatusNoToken:
+				retryable++
+			}
+		}
+		checkinMu.Lock()
+		if retryable == 0 || nowMin >= slotMin+120 {
+			// 无可重试状态，或已过该时段 2 小时（兜底，避免无限轮询）
+			checkinDone[key] = true
+			logger.Info("[Checkin] slot %s finished: %d claimed, %d already, %d retryable, total %d",
+				t, claimed, already, retryable, len(results))
+		} else {
+			logger.Info("[Checkin] slot %s partial: %d claimed, %d already, %d retryable -> retry next tick",
+				t, claimed, already, retryable)
+		}
+		checkinMu.Unlock()
+		ran = true
 	}
-	return true
+	return ran
 }

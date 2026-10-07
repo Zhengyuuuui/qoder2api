@@ -224,8 +224,10 @@
         <button id="checkinBtn">🎁 每日签到领 100 Credits</button>
         <label class="pill" style="cursor:pointer; margin-bottom:0">
           <input type="checkbox" id="autoCheckinToggle" style="width:auto; margin-right:6px">
-          每日 10:00 自动签到
+          自动签到
         </label>
+        <input id="autoCheckinTimes" placeholder="09:15,17:00" style="width:150px" title="每天自动签到的时间，逗号分隔，HH:MM；留空=10:00">
+        <button class="secondary" id="autoCheckinTimesSave">保存时间</button>
         <span class="msg" id="checkinMsg"></span>
       </div>
       <div id="checkinResult" style="margin-bottom:12px; display:none">
@@ -378,6 +380,9 @@
         if (document.activeElement !== $('autoCheckinToggle')) {
           $('autoCheckinToggle').checked = !!st.auto_checkin;
         }
+        if (document.activeElement !== $('autoCheckinTimes')) {
+          $('autoCheckinTimes').value = (st.auto_checkin_times || []).join(',');
+        }
       } catch (e) {
         fillConnection({}, {});
         $('connMsg').className = 'msg err';
@@ -396,9 +401,28 @@
           body: JSON.stringify({ auto_checkin: enabled }),
         });
         $('checkinMsg').className = 'msg ok';
-        $('checkinMsg').textContent = enabled ? '✅ 自动签到已开启（每日 10:00）' : '自动签到已关闭';
+        $('checkinMsg').textContent = enabled ? '✅ 自动签到已开启' : '自动签到已关闭';
       } catch (e) {
         ev.target.checked = !enabled;
+        $('checkinMsg').className = 'msg err';
+        $('checkinMsg').textContent = e.message;
+      }
+    };
+
+    // 自动签到时间保存
+    $('autoCheckinTimesSave').onclick = async () => {
+      const raw = ($('autoCheckinTimes').value || '').trim();
+      const times = raw ? raw.split(',').map(s => s.trim()).filter(s => s) : [];
+      $('checkinMsg').className = 'msg';
+      $('checkinMsg').textContent = '保存中...';
+      try {
+        await api('/api/settings/save', {
+          method: 'POST',
+          body: JSON.stringify({ auto_checkin_times: times }),
+        });
+        $('checkinMsg').className = 'msg ok';
+        $('checkinMsg').textContent = times.length ? ('✅ 签到时间已设为 ' + times.join(' / ')) : '✅ 已恢复默认（10:00）';
+      } catch (e) {
         $('checkinMsg').className = 'msg err';
         $('checkinMsg').textContent = e.message;
       }
@@ -435,6 +459,12 @@
         </thead>
         <tbody>${rows}</tbody>
       </table>`;
+    }
+
+    function fmtDur(ms) {
+      const sec = Math.max(0, Math.ceil(ms / 1000));
+      const m = Math.floor(sec / 60), r = sec % 60;
+      return m > 0 ? m + 'm' + String(r).padStart(2, '0') + 's' : r + 's';
     }
 
     function fmtNum(n) {
@@ -497,19 +527,30 @@
 
 
 
-    function renderAccounts(list) {
-      
+    function renderAccounts(list, pool) {
+      const poolById = {};
+      ((pool && pool.slots) || []).forEach(s => { poolById[s.id] = s; });
       if (!list || !list.length) {
         $('accountBody').innerHTML = '<tr><td colspan="4" class="muted">暂无账号</td></tr>';
         return;
       }
       $('accountBody').innerHTML = list.map(a => {
         const cachedQuota = quotaCache[a.id];
+        const slot = poolById[a.id];
+        const coolMs = slot ? (slot.cooling_remaining_ms || 0) : 0;
+        const poolBadge = slot
+          ? (coolMs > 0
+            ? `<span class="pill" style="border-color:#e6b800;background:#fff8e1;color:#8a6d00">冷却中 ${fmtDur(coolMs)}</span>`
+            : `<span class="pill" style="border-color:#8bc34a;background:#f1f8e9;color:#33691e">可用</span>`)
+          : '';
+        const poolNote = (slot && coolMs > 0 && slot.last_error)
+          ? `<div class="muted" style="font-size:11px">${slot.last_error}</div>` : '';
         return `
         <tr data-id="${a.id}">
           <td>
-            <div><strong>${a.name || a.id}</strong> ${a.active ? '<span class="pill">active</span>' : ''}</div>
+            <div><strong>${a.name || a.id}</strong> ${a.active ? '<span class="pill">active</span>' : ''} ${poolBadge}</div>
             <div class="muted">${a.email || '-'}</div>
+            ${poolNote}
           </td>
           <td>
             <div>${a.plan || '-'}</div>
@@ -520,6 +561,7 @@
             <button class="secondary" data-act="activate" data-id="${a.id}" ${a.active ? 'disabled' : ''}>激活</button>
             <button class="secondary" data-act="quota" data-id="${a.id}">刷新额度</button>
             <button class="secondary" data-act="checkin" data-id="${a.id}">🎁 签到</button>
+            <button class="secondary" data-act="cool" data-id="${a.id}">冷却</button>
             <button class="danger" data-act="delete" data-id="${a.id}">删除</button>
           </td>
         </tr>
@@ -548,8 +590,10 @@
       await loadConnection();
 
       try {
+        let pool = null;
+        try { pool = await api('/api/pool'); } catch (e) {}
         const accounts = await api('/api/accounts');
-        renderAccounts(accounts);
+        renderAccounts(accounts, pool);
         // 并行拉额度
         (accounts || []).forEach(a => loadQuota(a.id));
       } catch (e) {
@@ -829,6 +873,11 @@
             btn.disabled = false;
             btn.textContent = oldText;
           }
+        } else if (act === 'cool') {
+          const secs = parseInt(prompt('冷却该账号多少秒？（默认 300）', '300'), 10);
+          if (!secs || secs <= 0) return;
+          await api('/api/pool/cool', { method: 'POST', body: JSON.stringify({ id, seconds: secs, reason: 'manual' }) });
+          await refresh();
         } else if (act === 'delete') {
           if (!confirm('确认删除该账号？')) return;
           await api('/api/accounts/delete', { method: 'POST', body: JSON.stringify({ id }) });

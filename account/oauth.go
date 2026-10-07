@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,18 @@ import (
 // 3. 获取 device token (dt-xxx)，用于后续 API 调用
 
 const oauthClientID = "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb"
+
+// oauthSessionTTL 是待授权 OAuth 会话的有效期。默认 10 分钟（用户需在
+// 此时间内完成浏览器授权），可用 QODER2API_OAUTH_TIMEOUT 覆盖（如 "30m"）。
+func oauthSessionTTL() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("QODER2API_OAUTH_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+		logger.Error("invalid QODER2API_OAUTH_TIMEOUT=%q, falling back to 10m", v)
+	}
+	return 10 * time.Minute
+}
 
 type pendingOAuth struct {
 	loginID  string
@@ -70,7 +83,7 @@ func StartLogin(region Region) (*OAuthSession, error) {
 		region:   region,
 		ctx:      ctx,
 		cancel:   cancel,
-		deadline: time.Now().Add(10 * time.Minute),
+		deadline: time.Now().Add(oauthSessionTTL()),
 	}
 	pendingMu.Unlock()
 
@@ -280,10 +293,10 @@ func FetchQuota(token string, region Region) (*QuotaInfo, error) {
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	
+
 	fmt.Printf("[QUOTA DEBUG] API URL: %s\n", ep.QuotaEndpoint)
 	fmt.Printf("[QUOTA DEBUG] Raw response: %s\n", string(raw))
-	
+
 	var result map[string]interface{}
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, err

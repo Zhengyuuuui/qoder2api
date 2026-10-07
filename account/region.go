@@ -18,6 +18,7 @@ type Endpoints struct {
 	ChatStreamURL   string // SSE chat
 	ModelListURL    string // model list
 	JobTokenURL     string // PAT exchange
+	OpenAPIHost     string // OpenAPI 主机（签到/活动等 /sash、/api 接口）
 }
 
 var endpointsGlobal = Endpoints{
@@ -29,6 +30,7 @@ var endpointsGlobal = Endpoints{
 	ChatStreamURL:   "https://api1.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1",
 	ModelListURL:    "https://api2.qoder.sh/algo/api/v2/model/list?Encode=1",
 	JobTokenURL:     "https://center.qoder.sh/algo/api/v3/user/jobToken?Encode=1",
+	OpenAPIHost:     "openapi.qoder.sh",
 }
 
 var endpointsCN = Endpoints{
@@ -40,6 +42,7 @@ var endpointsCN = Endpoints{
 	ChatStreamURL:   "https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1",
 	ModelListURL:    "https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1",
 	JobTokenURL:     "https://gateway.qoder.com.cn/algo/api/v3/user/jobToken?Encode=1",
+	OpenAPIHost:     "openapi.qoder.com.cn",
 }
 
 // GetEndpoints 根据 region 返回对应端点配置，空值或未知值视为 global
