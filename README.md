@@ -15,13 +15,32 @@
 
 控制台「账号列表 / 额度」区域内置一键签到，可将 Qoder 官方 **每日 100 Credits** 活动直接打进控制台：
 
-- **🎁 一键签到**：顶部按钮批量对所有账号签到
+- **🎁 一键签到**：顶部按钮批量对所有账号签到（CN 与 Global 账号可混在同一实例）
 - **🎁 单账号签到**：账号表格「操作」列独立签到按钮
 - **⏰ 每日自动签到**：可选开关（**默认关闭**），开启后每天 `10:00 (UTC+8)` 自动为全部账号签到
+- **🔥 连续签到统计**：自动记录签到历史，跨天累计「连续 N 天 / 累计 N 天 / 共 N 积分」
 - **幂等安全**：已领取自动跳过，重复点击不会重复领取
 
-> 签到链路基于抓包还原：`GET /sash/api/v1/me/campaigns` → `POST /sash/api/v1/me/campaigns/{id}/claim`，
-> 仅需 device token + `cosy-clienttype: 10`，无需签名。详见 `scripts/auto_checkin.py`。
+### 双区域支持
+
+签到接口按账号 `region` 自动路由到对应站点，**同一控制台可同时管理国内版与国际版账号**：
+
+| Region | openapi 域名 | 签到接口 | 说明 |
+|--------|--------------|---------|------|
+| `cn` | `openapi.qoder.com.cn` | ✅ 可用 | 每日 100 Credits |
+| `global` | `openapi.qoder.sh` | ✅ 可用 | 每日 100 Credits（活动 ID 每日变化） |
+
+> 签到链路基于抓包还原，两区路径完全一致：
+> `GET /sash/api/v1/me/campaigns` → `POST /sash/api/v1/me/campaigns/{id}/claim`，
+> 仅需 device token + `cosy-clienttype: 10`，**无需 COSY 签名**。详见 `scripts/auto_checkin.py`。
+
+### 实现说明
+
+- **权威签到走 `campaigns`**：这是唯一真实发放积分的接口，返回 `grantId` 可核验
+- **不依赖 `daily-check-in`**：该 legacy 端点在国内已 `DISABLED` 且对未领取日恒返回 `409`（会误判），海外则直接 `404`
+- **领取窗口**：`10:00 → 次日 09:59 (UTC+8)`，窗口未开启时点击会明确提示下次开放时间
+- **连续天数本地统计**：上游 legacy 统计恒为 0，故由 qoder2api 记录 `checkin_history.json` 并按**活动窗口日期**（而非自然日）计算，避免 10:00 前误记
+- **调度容错**：10:00 整点若活动尚未下发，会每分钟重试至 12:00，避免漏签
 
 **手动签到 API**：
 
@@ -40,6 +59,21 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 ---
 
 ## 更新记录
+
+### 签到：支持 Global 国际版 + 修复「显示签到但没到账」
+
+- **双区域签到**：`account.Endpoints` 新增 `OpenAPIHost`，签到域名按账号 `region` 自动路由
+  （`cn` → `openapi.qoder.com.cn`，`global` → `openapi.qoder.sh`），
+  同一控制台实例可同时管理国内版与国际版账号，无需分实例
+- **修复空签到（重要）**：`daily-check-in/claim` 在国内已 `DISABLED`，却对**未领取日也恒返回 409**
+  （被误读为「已领取」而跳过真实领取）；海外该端点直接 404。
+  现已**彻底移除**对它的领取调用，`campaigns` 成为唯一权威签到路径（返回 `grantId` 可核验到账）
+- **窗口日期记账**：本地签到历史改按活动窗口 `startAt` 记录，而非自然日。
+  此前在 `10:00` 前点击（仍属前一日窗口）会把当天误记为已签，连续天数虚高
+- **提示更明确**：未到新窗口时明确输出「已领取 YYYY-MM-DD 窗口额度（新窗口 MM-DD 10:00 开放）」
+- **调度防漏签**：10:00 整点若活动尚未下发，不再标记当日完成，改为每分钟重试至 12:00
+- **连续签到统计**：本地 `checkin_history.json` 按账号分别记录，
+  跨天自动累计「连续 N 天 / 累计 N 天 / 共 N 积分」，支持断签识别
 
 ### 流稳定性 / 错误分类 / 安全加固
 
@@ -328,7 +362,7 @@ sudo systemctl enable --now qoder2api
 qoder2api/
 ├── main.go              # 入口：Web + API
 ├── service.go           # 账号 / Bridge 业务
-├── checkin.go           # 每日签到（手动 API + 10:00 自动调度）
+├── checkin.go           # 每日签到（手动 API + 10:00 自动调度 + 连续天数统计 + CN/Global 双区域）
 ├── account/             # 账号、OAuth、设置、密钥文件存储
 ├── cmd/checkin/         # 签到/额度只读调试工具
 ├── internal/
