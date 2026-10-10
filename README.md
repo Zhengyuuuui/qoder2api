@@ -17,7 +17,8 @@
 
 - **🎁 一键签到**：顶部按钮批量对所有账号签到（CN 与 Global 账号可混在同一实例）
 - **🎁 单账号签到**：账号表格「操作」列独立签到按钮
-- **⏰ 每日自动签到**：可选开关（**默认关闭**），开启后每天 `10:00 (UTC+8)` 自动为全部账号签到
+- **⏰ 每日自动签到**：可选开关（**默认关闭**），开启后每天 `10:00 (UTC+8)` 自动为全部账号签到；
+  签到时间点可配置（支持多时段，如 `09:15,17:00`）
 - **🔥 连续签到统计**：自动记录签到历史，跨天累计「连续 N 天 / 累计 N 天 / 共 N 积分」
 - **幂等安全**：已领取自动跳过，重复点击不会重复领取
 
@@ -53,6 +54,12 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 ```
 
 **开启每日自动签到**（默认关闭）：控制台勾选「每日 10:00 自动签到」即可，配置存于 `settings.json` 的 `auto_checkin` 字段。
+签到时间点可在控制台「自动签到时间」输入框配置（逗号分隔 `HH:MM`，留空为 `10:00`），
+或直接写入 `settings.json` 的 `auto_checkin_times` 字段，例如：
+
+```json
+{ "auto_checkin": true, "auto_checkin_times": ["09:15", "17:00"] }
+```
 
 ⚠️ 自动签到依赖服务常驻运行（电脑开机 + qoder2api 启动）。
 
@@ -62,7 +69,7 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 
 ### 签到：支持 Global 国际版 + 修复「显示签到但没到账」
 
-- **双区域签到**：`account.Endpoints` 新增 `OpenAPIHost`，签到域名按账号 `region` 自动路由
+- **双区域签到**（`b84c41b`）：`account.Endpoints` 新增 `OpenAPIHost`，签到域名按账号 `region` 自动路由
   （`cn` → `openapi.qoder.com.cn`，`global` → `openapi.qoder.sh`），
   同一控制台实例可同时管理国内版与国际版账号，无需分实例
 - **修复空签到（重要）**：`daily-check-in/claim` 在国内已 `DISABLED`，却对**未领取日也恒返回 409**
@@ -74,6 +81,7 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 - **调度防漏签**：10:00 整点若活动尚未下发，不再标记当日完成，改为每分钟重试至 12:00
 - **连续签到统计**：本地 `checkin_history.json` 按账号分别记录，
   跨天自动累计「连续 N 天 / 累计 N 天 / 共 N 积分」，支持断签识别
+- **签到时间可配置**（`fcde08e`）：`auto_checkin_times` 支持多时段（HH:MM 列表），留空默认 `10:00`
 
 ### 流稳定性 / 错误分类 / 安全加固
 
