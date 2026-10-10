@@ -11,6 +11,22 @@
 
 ---
 
+## 🙏 特别致谢 · 贡献者
+
+本项目的海外版签到、多账号池、图片输入等核心特性由社区贡献者 **[LeonardW-sl](https://github.com/LeonardW-sl)** 主导实现，特此致以诚挚谢意。
+
+| 贡献 | PR | 说明 |
+|------|-----|------|
+| **国际版（Global）签到支持** | [`b84c41b`](https://github.com/Zhengyuuuui/qoder2api/commit/b84c41b) | 新增 `Endpoints.OpenAPIHost`，签到域名按账号 `region` 自动路由（`cn` → `openapi.qoder.com.cn`，`global` → `openapi.qoder.sh`），修复国际账号 token 打到国内端点导致 `401 TOKEN_EXPIRE` 的问题；并补充 `TestCheckinHostForRegion` 单元测试 |
+| **每日自动签到时间可配置** | [`fcde08e`](https://github.com/Zhengyuuuui/qoder2api/commit/fcde08e) | 新增 `auto_checkin_times`，支持多时段签到（`HH:MM` 列表，留空默认 `10:00`） |
+| **多账号池** | [`c5fa3fa`](https://github.com/Zhengyuuuui/qoder2api/commit/c5fa3fa) ~ [`afe1d11`](https://github.com/Zhengyuuuui/qoder2api/commit/afe1d11) | 账号轮换、冷却、故障转移、状态持久化、池状态接口与控制台可视化 |
+| **图片输入（多模态）** | [`63cef2a`](https://github.com/Zhengyuuuui/qoder2api/commit/63cef2a) | 支持 `image_url` 类型的多模态请求 |
+| OAuth 会话 TTL 可配置 | [`624ccf6`](https://github.com/Zhengyuuuui/qoder2api/commit/624ccf6) | 新增 `QODER2API_OAUTH_TIMEOUT` 环境变量 |
+
+感谢 [@LeonardW-sl](https://github.com/LeonardW-sl) 的持续贡献与代码质量（含单元测试覆盖）。欢迎更多社区朋友参与共建。
+
+---
+
 ## ✨ 新功能：每日签到领 100 Credits
 
 控制台「账号列表 / 额度」区域内置一键签到，可将 Qoder 官方 **每日 100 Credits** 活动直接打进控制台：
@@ -26,10 +42,13 @@
 
 签到接口按账号 `region` 自动路由到对应站点，**同一控制台可同时管理国内版与国际版账号**：
 
-| Region | openapi 域名 | 签到接口 | 说明 |
-|--------|--------------|---------|------|
-| `cn` | `openapi.qoder.com.cn` | ✅ 可用 | 每日 100 Credits |
-| `global` | `openapi.qoder.sh` | ✅ 可用 | 每日 100 Credits（活动 ID 每日变化） |
+| Region | `Endpoints.OpenAPIHost` | 签到接口 | `daily-check-in/status` |
+|--------|-------------------------|---------|--------------------------|
+| `cn` | `openapi.qoder.com.cn` | ✅ 可用 | `200`（legacy 已 `DISABLED`，统计恒 0） |
+| `global` | `openapi.qoder.sh` | ✅ 可用 | `404`（该端点从未部署） |
+
+实现由 [@LeonardW-sl](https://github.com/LeonardW-sl) 在 [`b84c41b`](https://github.com/Zhengyuuuui/qoder2api/commit/b84c41b) 贡献：`account.Endpoints` 新增 `OpenAPIHost` 字段，
+`checkinAccount` 取 `checkinHostFor(acct.Region)` 后透传给 `campaignsCheckin` / `readDailyCheckinStats` / `doCheckinRequest`。
 
 > 签到链路基于抓包还原，两区路径完全一致：
 > `GET /sash/api/v1/me/campaigns` → `POST /sash/api/v1/me/campaigns/{id}/claim`，
@@ -37,11 +56,12 @@
 
 ### 实现说明
 
-- **权威签到走 `campaigns`**：这是唯一真实发放积分的接口，返回 `grantId` 可核验
-- **不依赖 `daily-check-in`**：该 legacy 端点在国内已 `DISABLED` 且对未领取日恒返回 `409`（会误判），海外则直接 `404`
+- **权威签到走 `campaigns`**：这是唯一真实发放积分的接口，返回 `grantId` 可核验到账
+- **不依赖 `daily-check-in`**：该 legacy 端点在国内已 `DISABLED` 且对未领取日恒返回 `409`（会误判为已领取而漏领），海外则直接 `404`
 - **领取窗口**：`10:00 → 次日 09:59 (UTC+8)`，窗口未开启时点击会明确提示下次开放时间
-- **连续天数本地统计**：上游 legacy 统计恒为 0，故由 qoder2api 记录 `checkin_history.json` 并按**活动窗口日期**（而非自然日）计算，避免 10:00 前误记
-- **调度容错**：10:00 整点若活动尚未下发，会每分钟重试至 12:00，避免漏签
+- **连续天数本地统计**：上游 legacy 统计恒为 0，故由 qoder2api 记录 `checkin_history.json` 并按**活动窗口 `startAt` 日期**（而非自然日）计算，避免 10:00 前误记
+- **调度容错**：签到时刻若活动尚未下发，不标记当日完成，每分钟重试至 12:00，避免漏签
+- **多时段支持**：`auto_checkin_times` 可配置多个 `HH:MM` 时间点（贡献者 `fcde08e`）
 
 **手动签到 API**：
 
@@ -68,6 +88,8 @@ curl -X POST http://127.0.0.1:3588/api/checkin -d '{"account_id":"acct_xxx"}'
 ## 更新记录
 
 ### 签到：支持 Global 国际版 + 修复「显示签到但没到账」
+
+> 本节特性由社区贡献者 [@LeonardW-sl](https://github.com/LeonardW-sl) 主导实现，详见文首[致谢](#🙏-特别致谢--贡献者)。
 
 - **双区域签到**（`b84c41b`）：`account.Endpoints` 新增 `OpenAPIHost`，签到域名按账号 `region` 自动路由
   （`cn` → `openapi.qoder.com.cn`，`global` → `openapi.qoder.sh`），
