@@ -32,8 +32,10 @@ type Service struct {
 	bridge      *bridge.Bridge
 	pool        *bridge.Pool
 	bridgeSrv   *http.Server
+	globalSrv   *http.Server // 8964：强制 Global 账号池
 	bridgeMu    sync.Mutex
 	bridgePort  int
+	globalPort  int
 	bridgeToken string
 	basePrompt  []byte
 }
@@ -176,14 +178,24 @@ func (s *Service) EnsureBridgeRunning() error {
 func (s *Service) StopBridge() error {
 	s.bridgeMu.Lock()
 	defer s.bridgeMu.Unlock()
+	var firstErr error
+	if s.globalSrv != nil {
+		if err := s.globalSrv.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.globalSrv = nil
+	}
 	if s.bridgeSrv == nil {
-		return nil
+		return firstErr
 	}
 	err := s.bridgeSrv.Close()
 	s.bridgeSrv = nil
 	s.bridge = nil
 	s.pool = nil
-	return err
+	if err != nil {
+		return err
+	}
+	return firstErr
 }
 
 func (s *Service) restartBridge(acct *account.Account) error {
@@ -249,21 +261,60 @@ func (s *Service) startBridgeWithAccount(acct *account.Account) error {
 	// mux 外包鉴权中间件：同网络客户端必须携带有效 token 才能消耗账号配额
 	handler := s.authMiddleware(mux)
 
-	srv := &http.Server{
-		Addr:    fmt.Sprintf("0.0.0.0:%d", s.bridgePort),
-		Handler: handler,
-	}
-
 	s.bridgeMu.Lock()
 	s.bridge = b
 	s.pool = pool
-	s.bridgeSrv = srv
+	s.bridgeSrv = &http.Server{
+		Addr:    fmt.Sprintf("0.0.0.0:%d", s.bridgePort),
+		Handler: handler,
+	}
 	s.bridgeMu.Unlock()
 
 	logger.Info("Bridge started on port %d", s.bridgePort)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.bridgeSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("bridge serve error: %v", err)
+		}
+	}()
+
+	// 8964：Global 专用桥，强制只走 Global 账号（跨区模型不能误打到国内号）
+	if s.globalPort > 0 && s.globalPort != s.bridgePort {
+		if err := s.startGlobalBridge(templateBase); err != nil {
+			// Global 池为空不应影响主桥，仅告警
+			logger.Info("global bridge (port %d) not started: %v", s.globalPort, err)
+		}
+	}
+	return nil
+}
+
+// startGlobalBridge 启动 8964 端口的 Global 专用桥。
+// 只纳入 region=global 的账号，避免国内账号被误用于国际模型请求。
+func (s *Service) startGlobalBridge(templateBase map[string]interface{}) error {
+	pool := s.buildRegionPool(account.RegionGlobal)
+	if pool.Size() == 0 {
+		return fmt.Errorf("no global account with usable secret")
+	}
+	b := bridge.NewPoolBridge(pool, templateBase)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", b.HandleChatCompletions)
+	mux.HandleFunc("/v1/messages", b.HandleClaudeMessages)
+	mux.HandleFunc("/v1/models", b.HandleListModels)
+	mux.HandleFunc("/v1/responses", b.HandleCodexResponses)
+
+	srv := &http.Server{
+		Addr:    fmt.Sprintf("0.0.0.0:%d", s.globalPort),
+		Handler: s.authMiddleware(mux),
+	}
+
+	s.bridgeMu.Lock()
+	s.globalSrv = srv
+	s.bridgeMu.Unlock()
+
+	logger.Info("Global bridge started on port %d (pool=%d global accounts)", s.globalPort, pool.Size())
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("global bridge serve error: %v", err)
 		}
 	}()
 	return nil
@@ -296,6 +347,39 @@ func (s *Service) buildAccountPool() *bridge.Pool {
 		logger.Info("buildAccountPool: added account %s (region=%s)", a.Name, a.Region)
 	}
 	// 账号全部入池后再恢复冷却状态（构造时空池 load 匹配不到 ID）。
+	pool.LoadState()
+	return pool
+}
+
+// buildRegionPool 只把指定区域的账号建成池（用于 8964 Global 专用桥）。
+// 状态文件按区域隔离，避免与主桥互相覆盖冷却记录。
+func (s *Service) buildRegionPool(region account.Region) *bridge.Pool {
+	pool := bridge.NewPoolWithState(filepath.Join(account.DataRoot(), "pool_state_"+string(region)+".json"))
+	accounts, err := account.List()
+	if err != nil {
+		logger.Error("buildRegionPool(%s): list accounts: %v", region, err)
+		return pool
+	}
+	for _, a := range accounts {
+		if a.Region != region {
+			continue
+		}
+		if !account.HasSecret(a.ID) {
+			continue
+		}
+		pat, err := account.GetSecret(a.ID)
+		if err != nil {
+			logger.Error("buildRegionPool(%s): get secret for %s: %v", region, a.Name, err)
+			continue
+		}
+		slot, err := bridge.NewSlotFromSecret(a.ID, a.Name, a.Region, pat)
+		if err != nil {
+			logger.Error("buildRegionPool(%s): account %s unusable, skipped: %v", region, a.Name, err)
+			continue
+		}
+		pool.Add(slot)
+		logger.Info("buildRegionPool(%s): added account %s", region, a.Name)
+	}
 	pool.LoadState()
 	return pool
 }

@@ -31,20 +31,25 @@ var svc *Service
 
 func main() {
 	webPort := flag.Int("web-port", 3588, "web console port")
-	bridgePort := flag.Int("bridge-port", 8963, "bridge api port")
+	bridgePort := flag.Int("bridge-port", 8963, "bridge api port (CN 优先，内部按模型 region 自动路由)")
+	globalPort := flag.Int("global-port", 8964, "global bridge api port (强制 Global 账号池)；0=不启动")
 	bind := flag.String("bind", "0.0.0.0", "console bind address")
 	dataDir := flag.String("data-dir", "", "data root (default: $QODER2API_HOME or ~/.qoder2api)")
-	instance := flag.String("instance", "", "preset: cn (3588/8963) or global (3589/8964); sets ports if not overridden")
+	instance := flag.String("instance", "", "preset: cn (单控制台 3588 + 双桥 8963/8964) 或 global (旧版独立实例 3589/8964)")
 	flag.Parse()
 
-	// 实例预设：方便 CN / Global 双开
+	// 实例预设：默认 cn = 单控制台 + 双桥（CN 8963 / Global 8964）
+	// global 预设保留给「只跑海外」的场景（独立控制台 3589 + 单桥 8964）
 	switch strings.ToLower(strings.TrimSpace(*instance)) {
-	case "cn", "china":
+	case "cn", "china", "":
 		if !isFlagPassed("web-port") {
 			*webPort = 3588
 		}
 		if !isFlagPassed("bridge-port") {
 			*bridgePort = 8963
+		}
+		if !isFlagPassed("global-port") {
+			*globalPort = 8964
 		}
 		if *dataDir == "" && os.Getenv("QODER2API_HOME") == "" {
 			if home, err := os.UserHomeDir(); err == nil {
@@ -57,6 +62,9 @@ func main() {
 		}
 		if !isFlagPassed("bridge-port") {
 			*bridgePort = 8964
+		}
+		if !isFlagPassed("global-port") {
+			*globalPort = 0 // 该模式只保留一个桥，8963 不启动
 		}
 		if *dataDir == "" && os.Getenv("QODER2API_HOME") == "" {
 			if home, err := os.UserHomeDir(); err == nil {
@@ -90,6 +98,9 @@ func main() {
 
 	if *bridgePort > 0 {
 		svc.bridgePort = *bridgePort
+	}
+	if *globalPort > 0 {
+		svc.globalPort = *globalPort
 	}
 
 	// cookie 按控制台端口隔离，避免 3588/3589 同 host 登录互踢
