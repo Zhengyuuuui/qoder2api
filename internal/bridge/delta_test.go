@@ -62,6 +62,33 @@ func TestExtractDeltaUsageWithContent(t *testing.T) {
 	}
 }
 
+// TestExtractDeltaCacheAndCredits 验证上游 usage 的缓存/计费明细被解析：
+// prompt_tokens_details.cached_tokens、completion_tokens_details.reasoning_tokens、
+// credits 与 original_credits。
+func TestExtractDeltaCacheAndCredits(t *testing.T) {
+	inner := `{"choices":[{"delta":{"content":"hi"}}],"usage":{` +
+		`"prompt_tokens":10617,"completion_tokens":12,` +
+		`"prompt_tokens_details":{"cached_tokens":10611,"cacheable_tokens":0},` +
+		`"completion_tokens_details":{"reasoning_tokens":8},` +
+		`"credits":0.0495,"original_credits":0.08}}`
+	d := ExtractDelta(envelopePayload(200, inner))
+	if d.Err != nil {
+		t.Fatalf("err = %v, want nil", d.Err)
+	}
+	if d.CachedTokens != 10611 || d.CacheableTokens != 0 {
+		t.Errorf("cached/cacheable = %d/%d, want 10611/0", d.CachedTokens, d.CacheableTokens)
+	}
+	if d.ReasoningTokens != 8 {
+		t.Errorf("reasoning = %d, want 8", d.ReasoningTokens)
+	}
+	if d.Credits != 0.0495 || d.OriginalCredits != 0.08 {
+		t.Errorf("credits = %v/%v, want 0.0495/0.08", d.Credits, d.OriginalCredits)
+	}
+	if d.Content != "hi" || d.InputTokens != 10617 || d.OutputTokens != 12 {
+		t.Errorf("content/usage lost: %+v", d)
+	}
+}
+
 // TestExtractDeltaUsageOnlyFrame 回归测试（review P2-4）：
 // usage-only 帧（choices 未命中内容）：行为与修复前一致，仅返回 tokens。
 // 注意顺序语义：业务错误 code 检查仍先于 usage-only 返回（见 envelope 业务错误用例）。

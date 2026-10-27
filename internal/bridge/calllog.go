@@ -16,29 +16,33 @@ import (
 //
 // 仅保留最近 N 条（内存环形缓冲，不落盘），重启清空。
 type CallRecord struct {
-	Seq           int       `json:"seq"`
-	Time          time.Time `json:"time"`           // 请求开始时间
-	RequestID     string    `json:"request_id"`     // 与原始日志 [Chat][xxxx] 对应的短 id
-	Protocol      string    `json:"protocol"`       // chat | claude | codex
-	Agent         string    `json:"agent"`          // claude | codex | gemini
-	Model         string    `json:"model"`          // 客户端请求的模型名
-	UpstreamModel string    `json:"upstream_model"` // 映射后的上游 model.key
-	Account       string    `json:"account"`        // 最终使用的账号名
-	AccountID     string    `json:"account_id"`     // 账号 id（排查用）
-	Region        string    `json:"region"`         // cn | global
-	Stream        bool      `json:"stream"`         // 客户端是否要求流式
-	Messages      int       `json:"messages"`       // 消息条数（上游请求体）
-	Tools         bool      `json:"tools"`          // 是否携带工具定义
-	PromptPreview string    `json:"prompt_preview"` // 最后一条 user 输入的前 N 个字符
-	Attempts      int       `json:"attempts"`       // 实际尝试过的账号数（>1 表示发生换号）
-	Status        string    `json:"status"`         // ok | error | cancelled
-	ErrorType     string    `json:"error_type,omitempty"`
-	ErrorMessage  string    `json:"error_message,omitempty"`
-	InputTokens   int       `json:"input_tokens"`
-	OutputTokens  int       `json:"output_tokens"`
-	DurationMS    int64     `json:"duration_ms"`
-	HadToolCalls  bool      `json:"had_tool_calls"` // 上游是否返回了工具调用
-	Emitted       bool      `json:"emitted"`        // 是否向客户端发过内容
+	Seq             int       `json:"seq"`
+	Time            time.Time `json:"time"`           // 请求开始时间
+	RequestID       string    `json:"request_id"`     // 与原始日志 [Chat][xxxx] 对应的短 id
+	Protocol        string    `json:"protocol"`       // chat | claude | codex
+	Agent           string    `json:"agent"`          // claude | codex | gemini
+	Model           string    `json:"model"`          // 客户端请求的模型名
+	UpstreamModel   string    `json:"upstream_model"` // 映射后的上游 model.key
+	Account         string    `json:"account"`        // 最终使用的账号名
+	AccountID       string    `json:"account_id"`     // 账号 id（排查用）
+	Region          string    `json:"region"`         // cn | global
+	Stream          bool      `json:"stream"`         // 客户端是否要求流式
+	Messages        int       `json:"messages"`       // 消息条数（上游请求体）
+	Tools           bool      `json:"tools"`          // 是否携带工具定义
+	PromptPreview   string    `json:"prompt_preview"` // 最后一条 user 输入的前 N 个字符
+	Attempts        int       `json:"attempts"`       // 实际尝试过的账号数（>1 表示发生换号）
+	Status          string    `json:"status"`         // ok | error | cancelled
+	ErrorType       string    `json:"error_type,omitempty"`
+	ErrorMessage    string    `json:"error_message,omitempty"`
+	InputTokens     int       `json:"input_tokens"`
+	OutputTokens    int       `json:"output_tokens"`
+	CachedTokens    int       `json:"cached_tokens"`    // 上游 prompt 缓存命中 token 数
+	ReasoningTokens int       `json:"reasoning_tokens"` // 其中推理 token（completion 明细）
+	Credits         float64   `json:"credits"`          // 本次计费 credits
+	OriginalCredits float64   `json:"original_credits"` // 优惠前 credits（不同即命中促销）
+	DurationMS      int64     `json:"duration_ms"`
+	HadToolCalls    bool      `json:"had_tool_calls"` // 上游是否返回了工具调用
+	Emitted         bool      `json:"emitted"`        // 是否向客户端发过内容
 }
 
 // 调用结果枚举

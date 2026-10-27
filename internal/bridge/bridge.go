@@ -475,6 +475,18 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		if d.OutputTokens > 0 {
 			rec.OutputTokens = d.OutputTokens
 		}
+		if d.CachedTokens > 0 {
+			rec.CachedTokens = d.CachedTokens
+		}
+		if d.ReasoningTokens > 0 {
+			rec.ReasoningTokens = d.ReasoningTokens
+		}
+		if d.Credits > 0 {
+			rec.Credits = d.Credits
+		}
+		if d.OriginalCredits > 0 {
+			rec.OriginalCredits = d.OriginalCredits
+		}
 		if d.ToolCalls != nil {
 			rec.HadToolCalls = true
 		}

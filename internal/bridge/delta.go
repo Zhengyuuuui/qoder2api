@@ -17,7 +17,13 @@ type Delta struct {
 	ToolCalls    []interface{}
 	InputTokens  int
 	OutputTokens int
-	Err          error // 上游返回业务错误时非 nil
+	// 缓存与计费明细（上游 usage 携带，控制台调用日志展示）
+	CachedTokens    int     // prompt_tokens_details.cached_tokens
+	CacheableTokens int     // prompt_tokens_details.cacheable_tokens
+	ReasoningTokens int     // completion_tokens_details.reasoning_tokens
+	Credits         float64 // 本次计费 credits
+	OriginalCredits float64 // 优惠前 credits（与 Credits 不同说明命中促销）
+	Err             error   // 上游返回业务错误时非 nil
 }
 
 func (d Delta) isEmpty() bool {
@@ -56,9 +62,24 @@ func ExtractDelta(dataLine string) Delta {
 	// 先捕获顶层 usage（上游可能在最后一个 chunk 中与 choices 一起返回），
 	// 不提前 return：同帧若还带 choices 内容，合并进同一个 Delta，避免内容丢失
 	var usageIn, usageOut int
+	var usageCached, usageCacheable, usageReasoning int
+	var usageCredits, usageOriginalCredits float64
 	if usage, ok := innerJSON["usage"].(map[string]interface{}); ok {
 		usageIn = int(cosy.FloatVal(usage, "prompt_tokens"))
 		usageOut = int(cosy.FloatVal(usage, "completion_tokens"))
+		if d, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
+			usageCached = int(cosy.FloatVal(d, "cached_tokens"))
+			usageCacheable = int(cosy.FloatVal(d, "cacheable_tokens"))
+		}
+		if d, ok := usage["completion_tokens_details"].(map[string]interface{}); ok {
+			usageReasoning = int(cosy.FloatVal(d, "reasoning_tokens"))
+		}
+		usageCredits = cosy.FloatVal(usage, "credits")
+		usageOriginalCredits = cosy.FloatVal(usage, "original_credits")
+		// 缓存命中排查：上游若返回 cached_tokens 等明细，Debug 级落盘
+		if raw, err := json.Marshal(usage); err == nil {
+			logger.Debug("[usage] %s", string(raw))
+		}
 	}
 	choices, _ := innerJSON["choices"].([]interface{})
 	for _, ch := range choices {
@@ -76,7 +97,9 @@ func ExtractDelta(dataLine string) Delta {
 		}
 		if role != "" || content != "" || reasoning != "" || toolCalls != nil {
 			return Delta{Role: role, Content: content, Reasoning: reasoning, ToolCalls: toolCalls,
-				InputTokens: usageIn, OutputTokens: usageOut}
+				InputTokens: usageIn, OutputTokens: usageOut,
+				CachedTokens: usageCached, CacheableTokens: usageCacheable,
+				ReasoningTokens: usageReasoning, Credits: usageCredits, OriginalCredits: usageOriginalCredits}
 		}
 	}
 	// 上游业务错误：{"code":"115","message":"..."}
@@ -91,7 +114,9 @@ func ExtractDelta(dataLine string) Delta {
 	}
 	// choices 与业务 code 均未命中且 usage > 0：维持返回 usage-only Delta（行为同修复前）
 	if usageIn > 0 || usageOut > 0 {
-		return Delta{InputTokens: usageIn, OutputTokens: usageOut}
+		return Delta{InputTokens: usageIn, OutputTokens: usageOut,
+			CachedTokens: usageCached, CacheableTokens: usageCacheable,
+			ReasoningTokens: usageReasoning, Credits: usageCredits, OriginalCredits: usageOriginalCredits}
 	}
 	logger.Debug("[delta] no valid choices found, inner=%s", inner)
 	return Delta{}

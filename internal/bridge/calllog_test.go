@@ -16,13 +16,25 @@ func sseContentWithUsage(text string, in, out int) string {
 	return fmt.Sprintf("data: {\"body\":%q,\"statusCodeValue\":200}\n\n", inner)
 }
 
+// sseContentWithCache 生成带缓存与计费明细的 usage 帧（对齐真实上游形态）。
+func sseContentWithCache(text string, in, out, cached int, credits float64) string {
+	inner := fmt.Sprintf(
+		`{"choices":[{"delta":{"content":%q}}],"usage":{`+
+			`"prompt_tokens":%d,"completion_tokens":%d,`+
+			`"prompt_tokens_details":{"cached_tokens":%d,"cacheable_tokens":0},`+
+			`"completion_tokens_details":{"reasoning_tokens":3},`+
+			`"credits":%f,"original_credits":%f}}`,
+		text, in, out, cached, credits, credits*2)
+	return fmt.Sprintf("data: {\"body\":%q,\"statusCodeValue\":200}\n\n", inner)
+}
+
 // TestCallLogRecordsSuccess 验证一次成功调用被完整记录：
 // 协议/模型映射/账号/token/耗时/预览。
 func TestCallLogRecordsSuccess(t *testing.T) {
 	ClearCalls()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, sseContentWithUsage("hello", 12, 7))
+		fmt.Fprint(w, sseContentWithCache("hello", 1200, 7, 1100, 0.05))
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer srv.Close()
@@ -54,8 +66,17 @@ func TestCallLogRecordsSuccess(t *testing.T) {
 	if rec.Account != "default" {
 		t.Errorf("account = %q, want default (单账号模式)", rec.Account)
 	}
-	if rec.InputTokens != 12 || rec.OutputTokens != 7 {
-		t.Errorf("tokens = %d/%d, want 12/7", rec.InputTokens, rec.OutputTokens)
+	if rec.InputTokens != 1200 || rec.OutputTokens != 7 {
+		t.Errorf("tokens = %d/%d, want 1200/7", rec.InputTokens, rec.OutputTokens)
+	}
+	if rec.CachedTokens != 1100 {
+		t.Errorf("cached = %d, want 1100", rec.CachedTokens)
+	}
+	if rec.ReasoningTokens != 3 {
+		t.Errorf("reasoning = %d, want 3", rec.ReasoningTokens)
+	}
+	if rec.Credits != 0.05 || rec.OriginalCredits != 0.1 {
+		t.Errorf("credits = %v/%v, want 0.05/0.1", rec.Credits, rec.OriginalCredits)
 	}
 	if !rec.Emitted {
 		t.Error("emitted should be true")

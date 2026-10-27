@@ -285,6 +285,7 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 | 账号 | 实际使用的账号名与区域；`⟳换号N` 表示发生失败转移 |
 | 模式 | 流式 / 非流式、是否带工具、上游是否返回工具调用 |
 | Token / 耗时 | 上游 usage（入/出）与端到端毫秒数 |
+| 缓存命中 / Credits | `cached_tokens / prompt_tokens` 命中率（附命中 token 数）与本次 `credits`；命中促销时显示原价 |
 | 请求预览 | 最后一条 user 输入（折叠空白、160 字符截断、HTML 转义）|
 | 错误 | 分类后的中文消息，直接显示在行内 |
 
@@ -293,7 +294,8 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 | `internal/bridge/calllog.go`（新增） | `CallRecord` / 环形缓冲（200 条，内存）/ `WithCallMeta` |
 | `internal/bridge/bridge.go` | `CallQoderWithOpts` 统一埋点：模型映射、选号、token、换号次数、耗时、错误分类 |
 | `internal/bridge/{chat,claude,codex}.go` | 入口注入 `CallMeta`（请求 id / 协议 / 是否流式）|
-| `internal/bridge/calllog_test.go`（新增） | 成功 / 错误 / 无账号 / 环形容量 / 截断 |
+| `internal/bridge/delta.go` | 解析 `prompt_tokens_details.cached_tokens` / `cacheable_tokens`、推理 token、`credits` / `original_credits` |
+| `internal/bridge/calllog_test.go`（新增） | 成功 / 错误 / 无账号 / 环形容量 / 截断；缓存与计费字段断言 |
 | `main.go` · `service.go` | `GET /api/calls?limit=N`（默认 100，上限 200）|
 | `webconsole/index.html` | 「模型调用日志」卡片：全部 / 仅错误 / 仅成功筛选，随 20s 刷新 |
 
