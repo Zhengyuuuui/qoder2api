@@ -654,6 +654,25 @@
         `;
       }
 
+      // 组织共享流量包（Team 账号）：个人套餐额度用尽后，上游自动从这里扣费。
+      // 不显示会让「剩余 0」被误认为账号不可用。
+      const org = q.org_resource_package;
+      if (org) {
+        const u = org.used || 0;
+        const t = org.cap || 0;              // 注意：总量字段是 cap，不是 total
+        const r = org.remaining != null ? org.remaining : (t - u);
+        const pct = t > 0 ? Math.min(100, Math.round((u / t) * 100)) : 0;
+        const cls = pct >= 90 ? 'bad' : (pct >= 70 ? 'warn' : '');
+        const state = org.available ? '' : ' <span class="muted">（当前不可用）</span>';
+        html += `
+          <div class="quota-block addon-block">
+            <strong>🏢 组织共享流量包</strong>${state}:
+            已用 ${fmtNum(u)} / ${fmtNum(t)} · 剩余 ${fmtNum(r)}${org.unit ? ' ' + org.unit : ''}<br/>
+            <div class="bar ${cls}"><i style="width:${pct}%"></i></div>
+          </div>
+        `;
+      }
+
       return html;
     }
 

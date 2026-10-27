@@ -107,8 +107,27 @@ type QuotaInfo struct {
 	UserQuota         *QuotaBucket       `json:"user_quota,omitempty"`
 	AddonQuota        *QuotaBucket       `json:"addon_quota,omitempty"`
 	DedicatedPackages []DedicatedPackage `json:"dedicated_packages,omitempty"`
-	IsQuotaExceeded   bool               `json:"is_quota_exceeded"`
-	ExpiresAt         int64              `json:"expires_at,omitempty"`
+	// OrgResourcePackage 组织共享流量包（Team 账号）。个人套餐额度用尽后，
+	// 上游会自动改从这个共享包扣费，因此 isQuotaExceeded 仍为 false。
+	// 仅在 userType=teams 且组织配置了共享包时出现。
+	OrgResourcePackage *OrgResourcePackage `json:"org_resource_package,omitempty"`
+	IsQuotaExceeded    bool                `json:"is_quota_exceeded"`
+	ExpiresAt          int64               `json:"expires_at,omitempty"`
+}
+
+// OrgResourcePackage 上游 orgResourcePackage 额度（Team 账号的组织共享流量）。
+//
+// 与其余额度桶的差异：
+//   - 总量字段叫 cap，不叫 total（最容易漏解析的点）
+//   - 单对象而非数组，字段名是单数 orgResourcePackage
+//   - available=false 表示该组织当前未开放共享包
+type OrgResourcePackage struct {
+	Cap        float64 `json:"cap"`
+	Used       float64 `json:"used"`
+	Remaining  float64 `json:"remaining"`
+	Percentage float64 `json:"percentage,omitempty"`
+	Unit       string  `json:"unit,omitempty"`
+	Available  bool    `json:"available"`
 }
 
 // DedicatedPackage 上游「专属资源包」额度（dedicatedResourcePackages）。

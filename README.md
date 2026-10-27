@@ -272,6 +272,35 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 
 ## 更新记录
 
+### 🏢 修复：Team 账号不显示组织共享流量包（2026-10-28）
+
+**2026-10-28 CST**
+
+Team 账号的个人套餐额度（`userQuota`，常见 3000）用尽后，上游会自动改从组织共享流量包
+`orgResourcePackage` 扣费，因此 `isQuotaExceeded` 仍为 `false`、请求照常可用。
+但控制台此前未解析该字段，会显示「剩余 0」，容易被误认为账号已不可用。
+
+上游真实响应（CN，`GET /api/v2/quota/usage`）：
+
+```json
+{
+  "userType": "teams",
+  "isQuotaExceeded": false,
+  "userQuota":         {"total": 3000, "used": 3000, "remaining": 0},
+  "orgResourcePackage": {"cap": 2000, "used": 13, "remaining": 1987, "available": true}
+}
+```
+
+| 文件 | 内容 |
+|------|------|
+| `account/model.go` | `QuotaInfo` 新增 `OrgResourcePackage`；新增 `OrgResourcePackage` 结构（**总量字段是 `cap` 而非 `total`**，且为单对象非数组）|
+| `account/oauth.go` | 新增 `extractOrgResourcePackage`，在 `FetchQuota` 中解析；个人账号无此字段时返回 `nil`，渲染与旧版完全一致 |
+| `account/quota_test.go`（新增） | 真实响应解析、字段缺失、类型异常容错、`QuotaInfo` 接线四组用例 |
+| `webconsole/index.html` | 账号额度区新增「🏢 组织共享流量包」进度条；`available=false` 时标注「当前不可用」|
+
+> 说明：本次只补**展示**。额度数据从不参与请求路由——选号只看冷却与模型目录
+> （见 `Pool.Pick`），额度是否耗尽由上游判定，耗尽后才触发失败换号与冷却。
+
 ### 🔁 排队等待升级：「首字前一直等」开关 + 最近等待记录（2026-10-27）
 
 **2026-10-27 CST**

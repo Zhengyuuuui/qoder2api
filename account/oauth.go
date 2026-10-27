@@ -327,7 +327,33 @@ func FetchQuota(token string, region Region) (*QuotaInfo, error) {
 	info.DedicatedPackages = extractDedicatedPackages(result)
 	fmt.Printf("[QUOTA DEBUG] dedicatedResourcePackages found: %d\n", len(info.DedicatedPackages))
 
+	// 组织共享流量包（Team 账号）。个人套餐额度用尽后上游自动改从这里扣费，
+	// 若不解析，控制台会显示「剩余 0」而误判账号不可用。
+	info.OrgResourcePackage = extractOrgResourcePackage(result)
+	if info.OrgResourcePackage != nil {
+		fmt.Printf("[QUOTA DEBUG] orgResourcePackage found: %+v\n", *info.OrgResourcePackage)
+	}
+
 	return info, nil
+}
+
+// extractOrgResourcePackage 解析上游 orgResourcePackage（Team 账号组织共享额度）。
+//
+// 与 userQuota/addOnQuota 的关键差异：总量字段名是 cap（不是 total），
+// 且为单对象而非数组。缺失（个人账号）时返回 nil，保持旧渲染行为不变。
+func extractOrgResourcePackage(data map[string]interface{}) *OrgResourcePackage {
+	obj, ok := data["orgResourcePackage"].(map[string]interface{})
+	if !ok || len(obj) == 0 {
+		return nil
+	}
+	return &OrgResourcePackage{
+		Cap:        toFloat(obj, "cap"),
+		Used:       toFloat(obj, "used"),
+		Remaining:  toFloat(obj, "remaining"),
+		Percentage: toFloat(obj, "percentage"),
+		Unit:       stringOf(obj, "unit"),
+		Available:  obj["available"] == true,
+	}
 }
 
 // extractDedicatedPackages 解析上游 dedicatedResourcePackages 数组。
