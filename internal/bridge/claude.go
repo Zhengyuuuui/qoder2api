@@ -83,7 +83,7 @@ func (b *Bridge) HandleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	logger.Info("[Claude][%s] model=%s stream=%v tools=%v thinking=%v max_tokens=%d msgs=%d", reqID, model, stream, toolsEnabled, opts.IsReasoning, opts.MaxTokens, len(incomingMsgs))
 
 	msgId := "msg_" + cosy.NewRequestID()
-	ctx := r.Context()
+	ctx := WithCallMeta(r.Context(), CallMeta{RequestID: reqID, Protocol: "claude", Stream: stream})
 
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")

@@ -272,6 +272,34 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 
 ## 更新记录
 
+### 📋 新增：模型调用日志（2026-10-28）
+
+原有「最近日志」是各模块混在一起的原始文本行，排查一次请求需要人工拼接
+`[Chat][xxxx]`、`callQoder: using account=...`、完成耗时等多行。新增一份
+**按请求结构化**的调用日志，控制台直接渲染成可读表格。
+
+| 字段 | 说明 |
+|------|------|
+| 时间 / 状态 | 开始时间；`OK` / `⚠️错误类型` / `🚫客户端断开` |
+| 协议 / 模型 | `chat` / `claude` / `codex`；客户端模型 → 映射后的上游 key（不同时并排显示）|
+| 账号 | 实际使用的账号名与区域；`⟳换号N` 表示发生失败转移 |
+| 模式 | 流式 / 非流式、是否带工具、上游是否返回工具调用 |
+| Token / 耗时 | 上游 usage（入/出）与端到端毫秒数 |
+| 请求预览 | 最后一条 user 输入（折叠空白、160 字符截断、HTML 转义）|
+| 错误 | 分类后的中文消息，直接显示在行内 |
+
+| 文件 | 内容 |
+|------|------|
+| `internal/bridge/calllog.go`（新增） | `CallRecord` / 环形缓冲（200 条，内存）/ `WithCallMeta` |
+| `internal/bridge/bridge.go` | `CallQoderWithOpts` 统一埋点：模型映射、选号、token、换号次数、耗时、错误分类 |
+| `internal/bridge/{chat,claude,codex}.go` | 入口注入 `CallMeta`（请求 id / 协议 / 是否流式）|
+| `internal/bridge/calllog_test.go`（新增） | 成功 / 错误 / 无账号 / 环形容量 / 截断 |
+| `main.go` · `service.go` | `GET /api/calls?limit=N`（默认 100，上限 200）|
+| `webconsole/index.html` | 「模型调用日志」卡片：全部 / 仅错误 / 仅成功筛选，随 20s 刷新 |
+
+> 仅内存保留（重启清空），与「最近排队等待」一致；原始行日志与文件归档行为不变。
+> 埋点在协议 handler 之下的唯一出口 `CallQoderWithOpts`，三套协议自动覆盖。
+
 ### 🔁 排队等待升级：「首字前一直等」开关 + 最近等待记录（2026-10-27）
 
 **2026-10-27 CST**

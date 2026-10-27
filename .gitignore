@@ -1,4 +1,6 @@
 qoder2api
+qoder2api.bak-*
+qoder2api.new
 *.exe
 *.log
 .DS_Store

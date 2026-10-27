@@ -455,6 +455,11 @@ func (s *Service) GetLogs(limit int) []logger.Entry {
 	return logger.GetLogs(limit)
 }
 
+// RecentCalls 返回最近的模型调用记录（结构化，供控制台「模型调用日志」面板）。
+func (s *Service) RecentCalls(limit int) []bridge.CallRecord {
+	return bridge.RecentCalls(limit)
+}
+
 func (s *Service) GetAccountQuota(accountID string) (*account.QuotaInfo, error) {
 	acct, err := account.Get(accountID)
 	if err != nil {

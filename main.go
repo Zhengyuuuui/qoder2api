@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -166,6 +167,7 @@ func main() {
 	mux.HandleFunc("/api/settings/save", handleSaveSettings)
 	mux.HandleFunc("/api/models", handleListModels)
 	mux.HandleFunc("/api/logs", handleLogs)
+	mux.HandleFunc("/api/calls", handleCalls)
 	mux.HandleFunc("/api/cleanup", handleCleanup)
 	mux.HandleFunc("/api/bridge/start", handleStartBridge)
 	mux.HandleFunc("/api/bridge/stop", handleStopBridge)
@@ -674,6 +676,20 @@ func handleListModels(w http.ResponseWriter, r *http.Request) {
 
 func handleLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, svc.GetLogs(100))
+}
+
+// handleCalls 返回最近的模型调用记录（结构化）。?limit= 控制条数（默认 100，上限 200）。
+func handleCalls(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"calls": svc.RecentCalls(limit)})
 }
 
 func handleCleanup(w http.ResponseWriter, r *http.Request) {

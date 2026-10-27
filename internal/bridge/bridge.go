@@ -426,13 +426,62 @@ func (b *Bridge) modelCatalog() []QoderModel {
 	return models
 }
 
-func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) error {
+func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) (err error) {
 	// 将客户端模型名（claude-sonnet-4-6 等）映射成 Qoder 上游内部 model.key（auto/qmodel_38max/gmodel/dmodel 等）。
 	// 上游对未知 key 会走兜底返回内容，但不会把这次调用计入 quota，这是「请求成功但 dashboard 无用量」的根因。
 	originalModel := model
 	model = MapModel(agent, model)
 	if model != originalModel {
 		logger.Debug("mapModel %s/%s -> %s", agent, originalModel, model)
+	}
+
+	// ---- 结构化调用日志（控制台「模型调用日志」面板）------------------------
+	// 记录一次请求最终落到哪个账号、映射后的模型、token 用量、耗时与结果。
+	// 与 logger 原始行日志并存：这里按字段拆分，便于可读渲染，不改变原有日志。
+	startedAt := time.Now()
+	meta := callMetaFrom(ctx)
+	rec := CallRecord{
+		Time:          startedAt,
+		RequestID:     meta.RequestID,
+		Protocol:      meta.Protocol,
+		Agent:         agent,
+		Model:         originalModel,
+		UpstreamModel: model,
+		Stream:        meta.Stream,
+		Messages:      len(messages),
+		Tools:         tools != nil,
+	}
+	defer func() {
+		rec.DurationMS = time.Since(startedAt).Milliseconds()
+		switch {
+		case err == nil:
+			rec.Status = CallStatusOK
+		case errors.Is(err, context.Canceled):
+			rec.Status = CallStatusCancelled
+		default:
+			rec.Status = CallStatusError
+			rec.ErrorType, rec.ErrorMessage = FriendlyError(err)
+			rec.ErrorMessage = truncateRunesForLog(rec.ErrorMessage, 240)
+		}
+		recentCallLog.record(rec)
+	}()
+
+	// 包装 delta 回调：顺带累计 token 用量与工具调用标记（不改动调用方逻辑）。
+	userOnDelta := onDelta
+	onDelta = func(d Delta) {
+		if d.InputTokens > 0 {
+			rec.InputTokens = d.InputTokens
+		}
+		if d.OutputTokens > 0 {
+			rec.OutputTokens = d.OutputTokens
+		}
+		if d.ToolCalls != nil {
+			rec.HadToolCalls = true
+		}
+		if !d.isEmpty() {
+			rec.Emitted = true
+		}
+		userOnDelta(d)
 	}
 
 	// 解析 context 档位：opts 未指定时按 settings 的全局/按模型配置选取，
@@ -529,6 +578,7 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	if len(prompt) > 80 {
 		preview = preview[:80] + "..."
 	}
+	rec.PromptPreview = truncateRunesForLog(prompt, 160)
 	logger.Info("callQoder region=%s model=%s prompt=%s", b.region, model, preview)
 
 	// ---- 账号池选号 + 失败换号 -------------------------------------------
@@ -546,6 +596,12 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		// 「请求是否路由到了未启动的那一侧账号」类问题。
 		logger.Info("callQoder: using account=%s id=%s region=%s model=%s",
 			slot.Name, slot.ID, slot.Region, model)
+		// 调用日志：以「最后一次尝试」的账号为准（成功即实际使用账号；
+		// 全部失败时即最后撞上的账号），Attempts 反映是否发生换号。
+		rec.Attempts++
+		rec.Account = slot.Name
+		rec.AccountID = slot.ID
+		rec.Region = string(slot.Region)
 		// 每个账号用全新的请求 id / session，避免跨账号复用同一标识
 		nid := cosy.NewUUID()
 		body["request_id"] = nid

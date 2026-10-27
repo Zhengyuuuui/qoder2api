@@ -307,6 +307,17 @@
     </section>
 
     <section class="card">
+      <h3>模型调用日志 <span class="muted" style="font-size:12px">（每次上游调用的结构化记录，最新在前；仅内存保留最近 200 条）</span></h3>
+      <div class="row" style="margin-bottom:10px; flex-wrap:wrap; gap:6px; align-items:center">
+        <button class="secondary" id="callsAllBtn">全部</button>
+        <button class="secondary" id="callsErrBtn">仅错误</button>
+        <button class="secondary" id="callsOkBtn">仅成功</button>
+        <span class="muted" id="callsHint" style="font-size:12px"></span>
+      </div>
+      <div id="callsBox" style="font-size:12px">加载中...</div>
+    </section>
+
+    <section class="card">
       <h3>模型排队重试 <span class="muted" style="font-size:12px">（上游 10605 isQueued 拥塞时，同账号等待重试；换号无益）</span></h3>
       <div class="row" style="gap:8px; flex-wrap:wrap; align-items:center">
         <span style="font-size:12px">最多重试</span>
@@ -567,6 +578,14 @@
     function fmtNum(n) {
       if (n == null || Number.isNaN(n)) return '-';
       return Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 });
+    }
+
+    // esc 把任意文本转义成可安全插入 innerHTML 的 HTML 片段。
+    // 调用日志会展示用户 prompt 与上游错误文本，必须转义。
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     function renderQuota(q) {
@@ -832,6 +851,78 @@
       }
     }
 
+    // ---- 模型调用日志 ------------------------------------------------------
+    // 记录按字段渲染成表格，替代原始行日志；filter: all | error | ok
+    let callsCache = [];
+    let callsFilter = 'all';
+
+    function callStatusBadge(r) {
+      if (r.status === 'ok') return '<span style="color:var(--ok,#16a34a);font-weight:600">✅ OK</span>';
+      if (r.status === 'cancelled') return '<span style="color:var(--muted)">🚫 客户端断开</span>';
+      return `<span style="color:var(--bad,#dc2626);font-weight:600">⚠️ ${esc(r.error_type || 'error')}</span>`;
+    }
+
+    function renderCalls() {
+      const box = $('callsBox');
+      const rows = callsCache.filter(r => {
+        if (callsFilter === 'error') return r.status !== 'ok';
+        if (callsFilter === 'ok') return r.status === 'ok';
+        return true;
+      });
+      $('callsHint').textContent = `共 ${callsCache.length} 条，当前显示 ${rows.length} 条 · 每 20s 自动刷新`;
+      if (!rows.length) {
+        box.innerHTML = '<span class="muted">暂无调用记录（有客户端请求后，这里会显示每次实际使用的账号与结果）</span>';
+        return;
+      }
+      const body = rows.map(r => {
+        const t = new Date(r.time).toLocaleTimeString();
+        const model = (r.upstream_model && r.upstream_model !== r.model)
+          ? `${esc(r.model)} <span class="muted">→ ${esc(r.upstream_model)}</span>`
+          : esc(r.model || '-');
+        const acct = r.account
+          ? `${esc(r.account)} <span class="muted">(${esc(r.region || '-')})</span>`
+          : '<span class="muted">未分配</span>';
+        const tok = (r.input_tokens || r.output_tokens)
+          ? `${r.input_tokens || 0} / ${r.output_tokens || 0}` : '-';
+        const flags = [
+          r.stream ? '流式' : '非流式',
+          r.tools ? '🛠' : '',
+          r.had_tool_calls ? '↩工具' : '',
+          r.attempts > 1 ? `⟳换号${r.attempts - 1}` : '',
+        ].filter(Boolean).join(' ');
+        const preview = r.prompt_preview ? `<div class="muted" style="margin-top:2px">${esc(r.prompt_preview)}</div>` : '';
+        const err = (r.status !== 'ok' && r.error_message)
+          ? `<div style="color:var(--bad,#dc2626);margin-top:2px">${esc(r.error_message)}</div>` : '';
+        return `<tr style="border-top:1px solid #0001;vertical-align:top">` +
+          `<td style="white-space:nowrap">${t}</td>` +
+          `<td>${callStatusBadge(r)}</td>` +
+          `<td>${esc(r.protocol || '-')}</td>` +
+          `<td>${model}</td>` +
+          `<td>${acct}</td>` +
+          `<td style="white-space:nowrap">${esc(flags)}</td>` +
+          `<td style="text-align:right;white-space:nowrap">${tok}</td>` +
+          `<td style="text-align:right;white-space:nowrap">${r.duration_ms}ms</td>` +
+          `<td style="min-width:180px">${preview}${err}</td>` +
+          `</tr>`;
+      }).join('');
+      box.innerHTML = `<table style="width:100%;border-collapse:collapse">` +
+        `<thead><tr style="text-align:left;color:var(--muted)">` +
+        `<th>时间</th><th>状态</th><th>协议</th><th>模型</th><th>账号</th>` +
+        `<th>模式</th><th style="text-align:right">Token(入/出)</th>` +
+        `<th style="text-align:right">耗时</th><th>请求预览</th></tr></thead>` +
+        `<tbody>${body}</tbody></table>`;
+    }
+
+    async function loadCalls() {
+      try {
+        const data = await api('/api/calls?limit=100');
+        callsCache = data.calls || [];
+        renderCalls();
+      } catch (e) {
+        $('callsBox').innerHTML = `<span class="msg err">${esc(e.message)}</span>`;
+      }
+    }
+
     async function refresh() {
       try {
         const status = await api('/api/status');
@@ -842,6 +933,7 @@
 
       await loadConnection();
       loadWaitLog();
+      loadCalls();
 
       try {
         let pool = null;
@@ -935,6 +1027,11 @@
 
     $('ctxTierSave').onclick = saveCtxTier;
     $('refreshBtn').onclick = refresh;
+
+    // 调用日志筛选
+    $('callsAllBtn').onclick = () => { callsFilter = 'all'; renderCalls(); };
+    $('callsErrBtn').onclick = () => { callsFilter = 'error'; renderCalls(); };
+    $('callsOkBtn').onclick = () => { callsFilter = 'ok'; renderCalls(); };
 
     // ===== Token 续期按钮绑定 =====
     $('refreshTokenBtn').onclick = () => runRefresh(false);
