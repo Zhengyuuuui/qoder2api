@@ -26,6 +26,10 @@ type QoderModel struct {
 	MaxOutputTokens int     `json:"max_output_tokens,omitempty"`
 	MaxInputTokens  int     `json:"max_input_tokens,omitempty"`
 	PriceFactor     float64 `json:"price_factor,omitempty"`
+	// 思考能力（来自上游 thinking_config，与 is_reasoning 相互独立）
+	ThinkingSupport bool     `json:"thinking_support,omitempty"`
+	ThinkingDefault bool     `json:"thinking_default,omitempty"`
+	ThinkingEfforts []string `json:"thinking_efforts,omitempty"`
 	// ContextTiers 上游 context_config 的全部档位（如 200K/400K/1M）。
 	ContextTiers []bridge.ContextTier `json:"context_tiers,omitempty"`
 }
@@ -511,6 +515,9 @@ func (s *Service) ListQoderModels() ([]QoderModel, error) {
 			PriceFactor:     m.PriceFactor,
 			ContextWindow:   m.ContextWindow,
 			MaxOutputTokens: m.MaxOutputTokens,
+			ThinkingSupport: m.ThinkingSupport,
+			ThinkingDefault: m.ThinkingDefault,
+			ThinkingEfforts: m.ThinkingEfforts,
 			ContextTiers:    m.ContextTiers,
 		}
 	}

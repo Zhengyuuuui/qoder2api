@@ -272,6 +272,30 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 
 ## 更新记录
 
+### 🧠 修正模型「思考」能力显示（2026-10-28）
+
+模型表此前的「推理」列只读上游 `is_reasoning`，导致 `dfmodel`（DeepSeek-Flash）、
+`kmodel_latest`（Kimi-K3.1-Pro）显示没有勾——但抓取原始 `model/list` 发现：
+
+| 模型 | `is_reasoning` | `thinking_config` | 实际能力 |
+|------|----------------|-------------------|----------|
+| `qmodel_38max` | true | 有（low/medium/xhigh）| 思考默认开 |
+| `dfmodel` | **false** | **有**（low/high/max，默认开）| 思考可开关 |
+| `kmodel_latest` | **false** | **有**（low/high/max，默认开）| 思考可开关 |
+| `mmodel` | false | 无 | 不支持 |
+
+即 `is_reasoning` 与 `thinking_config` 并不一致，前者不能代表"是否支持思考"。
+
+改动：
+
+- `QoderModel` 新增 `thinking_support` / `thinking_default` / `thinking_efforts`
+  （从 `thinking_config` 解析，efforts 按 low→max 排序）；
+- 控制台模型表「推理」列改为「思考」，显示 `默认开`/`可开关`/`常开`/`不支持`
+  以及可选档位；
+- 说明：bridge 请求模板默认 `model_config.is_reasoning=false`；Claude 客户端
+  发送 `thinking.type=enabled` 时 bridge 会置 true，OpenAI 兼容客户端没有标准开关。
+  上游即使未显式开启，也可能返回 `reasoning_tokens`（实测常见）。
+
 ### 🔁 排队等待升级：「首字前一直等」开关 + 最近等待记录（2026-10-27）
 
 **2026-10-27 CST**

@@ -100,6 +100,12 @@ type QoderModel struct {
 	MaxOutputTokens int     `json:"max_output_tokens,omitempty"`
 	MaxInputTokens  int     `json:"max_input_tokens,omitempty"`
 	PriceFactor     float64 `json:"price_factor,omitempty"`
+	// 思考能力（上游 thinking_config）。注意：上游的 is_reasoning 与
+	// thinking_config 并不一致——dfmodel / kmodel_latest 的 is_reasoning=false
+	// 但提供了 thinking_config（思考可开关，默认开），mmodel 两者皆无。
+	ThinkingSupport bool     `json:"thinking_support,omitempty"`
+	ThinkingDefault bool     `json:"thinking_default,omitempty"`
+	ThinkingEfforts []string `json:"thinking_efforts,omitempty"`
 	// ContextTiers 上游 context_config 的全部档位（如 200K/400K/1M）。
 	// 上游按模型提供多档 context，App 端可切换；此前只取 is_default 档，
 	// 导致大 context 档位丢失。
@@ -243,6 +249,23 @@ func parseQoderModels(resp map[string]interface{}) []QoderModel {
 	return nil
 }
 
+// sortThinkingEfforts 按 low < medium < high < xhigh < max 排序，
+// 未知值按字母序排在后面，保证控制台展示稳定。
+func sortThinkingEfforts(v []string) {
+	rank := map[string]int{"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
+	sort.Slice(v, func(i, j int) bool {
+		ri, iok := rank[strings.ToLower(v[i])]
+		rj, jok := rank[strings.ToLower(v[j])]
+		if iok && jok {
+			return ri < rj
+		}
+		if iok != jok {
+			return iok
+		}
+		return v[i] < v[j]
+	})
+}
+
 func extractModels(rawList []interface{}) []QoderModel {
 	out := make([]QoderModel, 0, len(rawList))
 	for _, it := range rawList {
@@ -259,6 +282,18 @@ func extractModels(rawList []interface{}) []QoderModel {
 			IsReasoning:    func() bool { v, _ := m["is_reasoning"].(bool); return v }(),
 			MaxInputTokens: int(cosy.FloatVal(m, "max_input_tokens")),
 			PriceFactor:    cosy.FloatVal(m, "price_factor"),
+		}
+		if tc, ok := m["thinking_config"].(map[string]interface{}); ok && len(tc) > 0 {
+			model.ThinkingSupport = true
+			if en, ok := tc["enabled"].(map[string]interface{}); ok {
+				model.ThinkingDefault, _ = en["is_default"].(bool)
+				if efforts, ok := en["efforts"].(map[string]interface{}); ok {
+					for name := range efforts {
+						model.ThinkingEfforts = append(model.ThinkingEfforts, name)
+					}
+					sortThinkingEfforts(model.ThinkingEfforts)
+				}
+			}
 		}
 		if cc, ok := m["context_config"].(map[string]interface{}); ok {
 			// 保留全部档位（上游按模型提供 200K/400K/1M 等多档）
