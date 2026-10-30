@@ -77,6 +77,16 @@
 
 ---
 
+## 🔗 相关：多平台合集面板
+
+如果你同时在用别的 AI 编程平台账号，可以看看这块合集面板：
+
+**[WorkBuddy2API Panel](https://github.com/xu20060420fan-cell/workbuddy2api-trae-qoder-minimax-panel)**
+
+同样支持 **Qoder**（每日额度按账号轮转领取、凭证自动续期），另外还统管 **WorkBuddy / CodeBuddy / Trae / MiniMax / 豆包 Doubao / 华为云 CodeArts 码道**，全部账号共用一个 OpenAI 兼容网关。
+
+---
+
 ## 🙏 特别致谢 · 贡献者
 
 本项目的海外版签到、多账号池、图片输入等核心特性由社区贡献者 **[LeonardW-sl](https://github.com/LeonardW-sl)** 主导实现，特此致以诚挚谢意。
