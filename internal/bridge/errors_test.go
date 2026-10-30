@@ -252,6 +252,42 @@ func TestParseUpstreamNestedError_NotNested(t *testing.T) {
 	}
 }
 
+// 回归：CALL_COUNT_LIMIT 与 RESOURCE_LIMIT 结构相同，但预筛选若只匹配带引号的
+// "subCode" 会因内层 JSON 引号被转义而漏掉它（isQueued/retryAfter 来不及解析），
+// 导致排队被误判成普通错误、进而冷却+换号。
+func TestParseUpstreamNestedErrorCallCountLimit(t *testing.T) {
+	detail := strings.ReplaceAll(
+		nestedResourceLimitDetail(true, true, 10),
+		"RESOURCE_LIMIT", "CALL_COUNT_LIMIT",
+	)
+	d, ok := parseUpstreamNestedError(detail)
+	if !ok {
+		t.Fatal("isQueued=true 的 CALL_COUNT_LIMIT 报文被预筛选漏掉")
+	}
+	if d.SubCode != "CALL_COUNT_LIMIT" || !d.IsQueued {
+		t.Errorf("parsed detail = %+v", d)
+	}
+}
+
+func TestFriendlyUpstreamError_CallCountLimitQueued(t *testing.T) {
+	// 真实场景：CALL_COUNT_LIMIT + isQueued=true 应按「排队」处理，
+	// 判为 upstream_queued 且不换号（否则误冷却+换号、等待策略不生效）。
+	detail := strings.ReplaceAll(
+		nestedResourceLimitDetail(true, true, 10),
+		"RESOURCE_LIMIT", "CALL_COUNT_LIMIT",
+	)
+	msg, et := FriendlyUpstreamError(403, detail)
+	if et != ErrTypeUpstreamQueue {
+		t.Errorf("errType = %q, want %q", et, ErrTypeUpstreamQueue)
+	}
+	if !strings.Contains(msg, "排队") {
+		t.Errorf("message should mention queueing, got: %s", msg)
+	}
+	if ShouldFailover(NewUpstreamError(403, detail)) {
+		t.Error("queued CALL_COUNT_LIMIT should NOT failover")
+	}
+}
+
 func TestFriendlyUpstreamError_ResourceLimit(t *testing.T) {
 	// 未排队且服务不可用（无 retryAfter）：账号无权使用该模型（确定性拒绝）
 	detail := nestedResourceLimitDetail(false, false, 0)

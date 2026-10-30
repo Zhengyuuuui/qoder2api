@@ -248,9 +248,12 @@ type upstreamErrorDetail struct {
 // 返回 (detail, ok)：ok=false 表示不是该格式（或解析失败），调用方应走原逻辑。
 func parseUpstreamNestedError(detail string) (*upstreamErrorDetail, bool) {
 	detail = strings.TrimSpace(detail)
-	// 快速筛：必须同时含 subCode / RESOURCE_LIMIT 之类的关键字才尝试解析，
+	// 快速筛：含 subCode 字段名或 RESOURCE_LIMIT 关键字才尝试完整解析，
 	// 避免对每个错误都做三次 JSON 反序列化。
-	if !strings.Contains(detail, `"subCode"`) && !strings.Contains(detail, "RESOURCE_LIMIT") {
+	// 注意：内层 JSON 嵌在外层 message 字符串里，字段名的引号被转义成 \"subCode\"，
+	// 故这里匹配不带引号的 subCode——否则 CALL_COUNT_LIMIT 等非 RESOURCE_LIMIT
+	// 的嵌套报文会在预筛选阶段被漏掉（isQueued/retryAfter 来不及解析）。
+	if !strings.Contains(detail, "subCode") && !strings.Contains(detail, "RESOURCE_LIMIT") {
 		return nil, false
 	}
 	// detail 可能带 "upstream 403: " 之类前缀，从第一个 "{" 开始才是 JSON。

@@ -272,6 +272,22 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 
 ## 更新记录
 
+### 🐛 修复：CALL_COUNT_LIMIT 排队报文被预筛选漏掉（2026-10-27）
+
+**2026-10-27 CST**
+
+`parseUpstreamNestedError()` 的预筛选原先匹配**带引号**的 `"subCode"`，但上游把内层 JSON
+嵌在外层 `message` 字符串里、字段名的引号被转义成 `\"subCode\"`。于是与 `RESOURCE_LIMIT`
+**同构**的 `CALL_COUNT_LIMIT`（带 `isQueued:true` / `retryAfterSeconds`）在预筛选阶段就被判为
+非嵌套错误——`isQueued`/`retryAfter` 来不及解析，排队被误判成普通 `upstream_error`，
+进而**冷却 + 换号**，导致「首字前一直等」不生效、`/api/queue/log` 无记录。
+
+**修复**：预筛选改匹配**不带引号**的 `subCode`（后续完整 JSON 解析不变），
+`RESOURCE_LIMIT` / `CALL_COUNT_LIMIT` 等所有带 `subCode` 的嵌套报文都能正确解析，
+`isQueued=true` 一律判为 `upstream_queued`（不换号、进入同账号等待）。
+
+**回归测试**：`TestParseUpstreamNestedErrorCallCountLimit` / `TestFriendlyUpstreamError_CallCountLimitQueued`。
+
 ### 🔁 排队等待升级：「首字前一直等」开关 + 最近等待记录（2026-10-27）
 
 **2026-10-27 CST**
