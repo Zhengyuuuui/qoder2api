@@ -189,6 +189,11 @@ func isPublicPath(path string) bool {
 	if strings.HasPrefix(path, "/api/auth/") {
 		return true
 	}
+	// 健康检查端点：外部探针（负载均衡 / k8s liveness）无法携带控制台
+	// 会话，故放行。它只暴露风控计数摘要，不含任何凭据。
+	if path == "/health" {
+		return true
+	}
 	// static assets for login page
 	if strings.HasPrefix(path, "/assets/") {
 		return true

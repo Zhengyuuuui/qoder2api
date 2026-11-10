@@ -17,12 +17,36 @@ import (
 	"qoder2api/logger"
 )
 
-func qoderChatStreamURL(region account.Region) string {
-	return account.GetEndpoints(region).ChatStreamURL
+// qoderChatStreamCandidates 返回该区域的推理端点候选（按优先级）。
+func qoderChatStreamCandidates(region account.Region) []string {
+	return account.GetEndpoints(region).ChatStreamCandidates()
 }
 
-func qoderModelListURL(region account.Region) string {
-	return account.GetEndpoints(region).ModelListURL
+// qoderModelListCandidates 返回该区域的模型目录端点候选（按优先级）。
+func qoderModelListCandidates(region account.Region) []string {
+	return account.GetEndpoints(region).ModelListCandidates()
+}
+
+// regionProxyBinding 区域级出口绑定（账号 ID 之前的阶段专用）。
+//
+// 为什么需要：jobToken 交换 / userinfo / 设备登录轮询都发生在「拿到
+// 账号 ID 之前」，此时没有账号级代理可绑，只能按区域代理兜底。两难是
+// 显式的：这一阶段的出口只能是区域级——若区域也没配，才是合法的
+// 「未配置 → 直连」；区域配了却非法时调用方必须看到 ConfigErr，
+// 不能静默直连。
+func regionProxyBinding(region account.Region) ProxyBinding {
+	return ResolveRegionProxyBinding(string(region))
+}
+
+// regionHTTPClient 区域级出口的 HTTP 客户端（按区域缓存 Transport）。
+// 账号 ID 之前的阶段（凭证交换 / userinfo / 设备登录）用它，保证这些
+// 流量与对话流量走同一条区域出口，不出现「双出口」画像。
+func regionHTTPClient(region account.Region, timeout time.Duration) (*http.Client, error) {
+	binding := regionProxyBinding(region)
+	if binding.ConfigErr != nil {
+		return nil, binding.ConfigErr
+	}
+	return HTTPClientForKey("region|"+string(region), binding.URL, timeout), nil
 }
 
 func ParseOAuthSecret(secret string) (deviceToken, refreshToken string) {
@@ -53,11 +77,20 @@ func ResolveOAuthUserID(userInfo map[string]interface{}) string {
 	return StrVal(userInfo, "uid")
 }
 
+// FetchUserInfoWithToken 拉取 userinfo（账号 ID 之前的阶段，按区域代理出口）。
+//
+// 用 DefaultClient 直连会让「对话走代理、userinfo 走数据中心」形成双
+// 出口——正是上游关联「同一使用群体」的典型信号。此处按区域代理走，
+// 与对话流量同出口。
 func FetchUserInfoWithToken(token string, region account.Region) (map[string]interface{}, error) {
 	ep := account.GetEndpoints(region)
 	req, _ := http.NewRequest("GET", ep.UserinfoBase, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	client, err := regionHTTPClient(region, 15*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("region proxy config invalid: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -159,9 +192,18 @@ func NewBridgeWithFP(pat string, region account.Region, templateBase map[string]
 		}
 	} else {
 		// jobToken 交换发生在拿到 uid 之前：机器头用凭证种子稳定派生
-		// （hub 的交换请求不带机器头，此处保留 QCCG 原有行为但消除随机漂移）
+		// （交换请求不带机器头亦可完成；此处保留带机器头的行为但消除随机漂移）
+		//
+		// 出口按区域代理：此刻没有账号 ID，只能按区域绑定（见
+		// regionProxyBinding 的两难说明）。
 		seed := cosy.FingerprintSeed("", pat)
-		jt, err := cosy.ExchangeJobToken(pat, cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed), account.GetEndpoints(region).JobTokenURL)
+		client, err := regionHTTPClient(region, 15*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("region proxy config invalid: %w", err)
+		}
+		jt, err := cosy.ExchangeJobTokenWithClient(client, pat,
+			cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed),
+			account.GetEndpoints(region).JobTokenURL)
 		if err != nil {
 			return nil, fmt.Errorf("exchangeJobToken: %w", err)
 		}
@@ -212,8 +254,11 @@ func (b *Bridge) ListAvailableModels() ([]QoderModel, error) {
 	if !ok {
 		return nil, ErrNoAccount
 	}
-	modelListURL := qoderModelListURL(slot.Region)
-	resp, err := slot.client.callGet(modelListURL)
+	modelListURLs := qoderModelListCandidates(slot.Region)
+	if len(modelListURLs) == 0 {
+		return nil, fmt.Errorf("no model list endpoint for region %s", slot.Region)
+	}
+	resp, err := slot.client.callGetCandidates("model_list", modelListURLs)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +270,7 @@ func (b *Bridge) ListAvailableModels() ([]QoderModel, error) {
 	logger.Info("model list response keys: %v (region=%s)", keys, slot.Region)
 	models := parseQoderModels(resp)
 	if len(models) == 0 {
-		return nil, fmt.Errorf("%s -> empty model list, keys=%v", modelListURL, keys)
+		return nil, fmt.Errorf("%s -> empty model list, keys=%v", modelListURLs[0], keys)
 	}
 	return models, nil
 }
@@ -318,6 +363,9 @@ func DeepCopyMap(m map[string]interface{}) map[string]interface{} {
 type CallOpts struct {
 	IsReasoning bool // 是否启用推理模式（对应上游 model_config.is_reasoning）
 	MaxTokens   int  // 客户端请求的 max_tokens，0 表示使用模板默认值
+	// SessionKey 客户端显式提供的会话键（Claude Code / Codex 等惯例）。
+	// 空时由 CallQoderWithOpts 按首条 user 消息内容哈希派生（见 affinity.go）。
+	SessionKey string
 	// ContextTokens 指定的 context 档位 token 数（如 400000）。
 	// 0 表示使用上游默认档。非 0 时写入 model_config.max_input_tokens。
 	//
@@ -339,6 +387,15 @@ func (b *Bridge) CallQoder(ctx context.Context, agent string, messages []interfa
 // 让 openStreamLines 及时退出——上游发出错误帧后若不关流，否则重开闸门
 // 永不触发、请求挂起；错误由 CallQoder 在流结束后统一返回。
 func deltaDispatcher(onDelta func(Delta), upstreamErr *error) func(string) bool {
+	return deltaDispatcherWithHook(onDelta, upstreamErr, nil)
+}
+
+// deltaDispatcherWithHook 在分发 SSE 行时，可选地对捕获到的流内错误
+// 调用 onError 钩子（用于风控打点）。
+//
+// 为什么要钩子而不是在别处再解析一遍：流内错误帧是排队 / 频控信号的
+// 主要来源，重新解析会重复构造错误对象；钩子保证「一次解析、一次打点」。
+func deltaDispatcherWithHook(onDelta func(Delta), upstreamErr *error, onError func(error)) func(string) bool {
 	return func(line string) bool {
 		if *upstreamErr != nil {
 			return false
@@ -353,6 +410,9 @@ func deltaDispatcher(onDelta func(Delta), upstreamErr *error) func(string) bool 
 		delta := ExtractDelta(dataPayload)
 		if delta.Err != nil {
 			*upstreamErr = delta.Err
+			if onError != nil {
+				onError(delta.Err)
+			}
 			return false
 		}
 		if !delta.isEmpty() {
@@ -435,6 +495,14 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		logger.Debug("mapModel %s/%s -> %s", agent, originalModel, model)
 	}
 
+	// 自适应节流打点：每个客户端请求计一次（成功在下方打点）。信号
+	// （排队/频控）由客户端层 noteRisk 逐次观测打点，与遥测同口径。
+	ThrottleNoteRequest()
+
+	// 会话键：显式 ID 优先，否则按首条 user 消息内容哈希派生。
+	// 空串 = 无法派生（无 user 消息等），调用方走普通选号。
+	sessionKey := ExtractSessionKey(opts.SessionKey, messages)
+
 	// 解析 context 档位：opts 未指定时按 settings 的全局/按模型配置选取，
 	// 并用该账号的模型目录把档位名换成 token 数。
 	if opts.ContextTokens == 0 {
@@ -453,6 +521,14 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	}
 
 	if opts.MaxTokens > 0 {
+		// 上限保护：超长输出会拉长单请求占用、放大排队概率。下调并打
+		// 日志而非拒请求——客户端往往只是没设好，直接拒浪费请求。
+		effective, clamped := ClampMaxTokens(opts.MaxTokens)
+		if clamped {
+			logger.Info("[max_tokens] request %d clamped to %d for model %s",
+				opts.MaxTokens, effective, model)
+		}
+		opts.MaxTokens = effective
 		if params, ok := body["parameters"].(map[string]interface{}); ok {
 			params["max_tokens"] = opts.MaxTokens
 		}
@@ -537,8 +613,12 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	// 客户端参数错/内容审核则立即上抛——避免重复内容、避免无意义换号。
 	tried := make(map[string]struct{})
 	var lastErr error
+	// 亲和首选账号：查询一次即计命中率。绑定账号不可用（冷却/熔断）时
+	// 下方自然走普通选号换号；排队等待发生在 streamWithSlot 内部
+	// （同账号重试），走不到这里——亲和永不被排队解绑。
+	preferred := AffinityAccount(sessionKey)
 	for {
-		slot, ok := b.pickSlotForModel(model, tried)
+		slot, ok := b.pickSlotWithAffinity(model, tried, preferred)
 		if !ok {
 			break
 		}
@@ -558,22 +638,36 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 			biz["begin_at"] = cosy.UnixMs()
 		}
 
-		qurl := b.chatStreamURL
-		if qurl == "" {
-			qurl = qoderChatStreamURL(slot.Region)
+		// 推理端点候选：测试注入时用单点，否则用该区域的候选列表
+		// （端点之间可故障转移，见 internal/bridge/endpoints.go）。
+		qurls := []string{b.chatStreamURL}
+		if qurls[0] == "" {
+			qurls = qoderChatStreamCandidates(slot.Region)
+		}
+		if len(qurls) == 0 {
+			return fmt.Errorf("no chat stream endpoint for region %s", slot.Region)
 		}
 		logger.Debug("callQoder request body: %s", func() string { d, _ := json.Marshal(body); return string(d) }())
 
-		emitted, err := b.streamWithSlot(ctx, slot, qurl, body, extra, onDelta)
+		emitted, err := b.streamWithSlot(ctx, slot, qurls, body, extra, onDelta)
 		if err == nil {
 			b.noteSlotSuccess(slot.ID)
+			ThrottleNoteSuccess()
+			// 成功即（重）绑定：换号后的第一个成功账号成为新亲和目标
+			AffinityBind(sessionKey, slot.ID)
 			return nil
 		}
 		lastErr = err
 		if emitted || !ShouldFailover(err) {
-			return err
+			// 已发出内容不能换号（客户端会收到重复内容）；客户端参数错 /
+			// 内容审核换号无意义。两种情况都不动账号冷却状态，
+			// 但未知失败仍要计入降权计数——否则反复的流内业务错误
+			// 永远不会让持续出问题的账号被降权。
+			b.failSlot(slot.ID, model, err)
+			return b.decorateCredentialError(err, model)
 		}
-		b.coolSlot(slot.ID, CooldownFor(err), err.Error())
+		// 按失败归类决定写账号级冷却还是模型级冷却，并累计熔断 / 降权计数。
+		b.failSlot(slot.ID, model, err)
 		tried[slot.ID] = struct{}{}
 		logger.Info("callQoder: account=%s id=%s region=%s failed, failing over to next account: %v",
 			slot.Name, slot.ID, slot.Region, err)
@@ -584,6 +678,34 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	return lastErr
 }
 
+// decorateCredentialError 为凭证类错误补上模型名。
+//
+// 「模型不在套餐内」这类错误的提示必须点名是哪个模型——用户看到
+// 「模型不在此账号的套餐范围内」不知道该换什么，点名才有可操作性。
+// 非凭证类错误原样返回。
+func (b *Bridge) decorateCredentialError(err error, model string) error {
+	var ue *UpstreamError
+	if !errors.As(err, &ue) {
+		return err
+	}
+	switch ue.ErrType {
+	case ErrTypeTokenExpired, ErrTypeQuotaExhausted, ErrTypeTrialRestricted, ErrTypeModelNotAllowed:
+	default:
+		return err
+	}
+	kind := classifyCredentialError(ue.Detail)
+	if kind == credentialNone {
+		return err
+	}
+	msg := credentialMessage(kind, model, ue.Detail)
+	if msg == "" {
+		return err
+	}
+	cp := *ue
+	cp.Message = msg
+	return &cp
+}
+
 // streamWithSlot 在单个账号上执行流式请求，含两层有界重试：
 //  1. 队列拥塞重试（本层）：上游 10605 isQueued 时，同账号等待 retryAfterSeconds
 //     后重试，最多 QueueMaxRetries 次。换号无益（同模型同队列），故不在此层换号。
@@ -591,7 +713,7 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 //
 // 返回是否已向 onDelta 发出过内容——上层据此决定能否换号（已发出内容则不能，
 // 否则客户端会收到重复内容）。
-func (b *Bridge) streamWithSlot(ctx context.Context, slot *Slot, qurl string, body map[string]interface{}, extra map[string]string, onDelta func(Delta)) (bool, error) {
+func (b *Bridge) streamWithSlot(ctx context.Context, slot *Slot, qurls []string, body map[string]interface{}, extra map[string]string, onDelta func(Delta)) (bool, error) {
 	model := modelKeyFromBody(body)
 	queueTries := 0
 	totalWait := time.Duration(0)
@@ -602,8 +724,40 @@ func (b *Bridge) streamWithSlot(ctx context.Context, slot *Slot, qurl string, bo
 		}
 		return emitted, err
 	}
+	// 流量闸门：建流前申请租约（单账号并发上限 + 请求节奏整形）。
+	//   - 拿到租约：起心跳 goroutine 续租——长流式请求（agent 任务可跑
+	//     数小时）靠它避免被误判为泄漏回收；心跳按定时器触发而非「收到
+	//     行」触发，因为模型思考 / 工具执行期间可能长时间没有新数据。
+	//   - 未拿到但被放行（err==nil, leaseID 空）：fail-open，继续发。
+	//   - ErrGuardSaturated：软放行配额耗尽，拒流（客户端可重试）。
+	//   - ctx 取消：原样上抛。
+	// defer 覆盖全部返回路径（正常结束、上游错误、ctx 取消）；排队等待
+	// 期间租约持有（请求仍在该账号上在飞）。
+	leaseID, guardErr := AcquireLeaseOrReject(ctx, slot)
+	if guardErr != nil {
+		return false, guardErr
+	}
+	defer ReleaseLease(slot, leaseID)
+	if leaseID != "" {
+		stopHeartbeat := make(chan struct{})
+		defer close(stopHeartbeat)
+		go func() {
+			ticker := time.NewTicker(leaseHeartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					TouchLease(slot, leaseID)
+				case <-stopHeartbeat:
+					return
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 	for {
-		emitted, err := b.streamWithTransientRetry(ctx, slot, qurl, body, extra, onDelta)
+		emitted, err := b.streamWithTransientRetry(ctx, slot, qurls, body, extra, onDelta)
 		if err == nil {
 			return finish(WaitOutcomeSuccess, emitted, nil)
 		}
@@ -614,9 +768,16 @@ func (b *Bridge) streamWithSlot(ctx context.Context, slot *Slot, qurl string, bo
 				logger.Info("upstream queued, gave up after %d tries (~%s): %v", queueTries, totalWait, err)
 				return finish(WaitOutcomeGaveUp, emitted, err)
 			}
+			// 总预算兜底：即使「首字前一直等」也不能无限挂起——客户端连接
+			// 与账号配额都被白白占用。超过预算按拥塞（503）上抛。
 			wait := queueRetryAfter(err)
-			logger.Info("upstream queued (model congested), waiting %s before retry on same account (try %d, waited ~%s): %v",
-				wait, queueTries+1, totalWait, err)
+			if totalWait+wait > QueueWaitBudget {
+				logger.Info("upstream queued, giving up: waited %s over %d tries, budget %s exhausted: %v",
+					totalWait, queueTries+1, QueueWaitBudget, err)
+				return finish(WaitOutcomeGaveUp, emitted, err)
+			}
+			logger.Info("upstream queued (model congested), waiting %s before retry on same account (try %d, waited ~%s, budget %s; session affinity kept): %v",
+				wait, queueTries+1, totalWait, QueueWaitBudget, err)
 			if serr := sleepCtx(ctx, wait); serr != nil {
 				// ctx 取消/超时：上抛最后一次错误
 				return finish(WaitOutcomeCancelled, emitted, err)
@@ -640,11 +801,21 @@ func modelKeyFromBody(body map[string]interface{}) string {
 	return ""
 }
 
+// modelKeyFromAny 从任意请求体（可能是 map 或其他类型）解析模型 key。
+// 客户端层的请求体是 interface{}，风控打点需要从中取出模型名。
+func modelKeyFromAny(body interface{}) string {
+	m, ok := body.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	return modelKeyFromBody(m)
+}
+
 // streamWithTransientRetry 在单个账号上执行「SSE 信封重试闸门」。
 // 连接阶段错误已由 openStreamLines 内部重试；此处是第二层防护（有界：
 // 最多 TransientMaxRetries 次），主要覆盖上游 HTTP200 建流后才在信封里
 // 投递 418/5xx 的形态。返回是否已向 onDelta 发出过内容。
-func (b *Bridge) streamWithTransientRetry(ctx context.Context, slot *Slot, qurl string, body map[string]interface{}, extra map[string]string, onDelta func(Delta)) (bool, error) {
+func (b *Bridge) streamWithTransientRetry(ctx context.Context, slot *Slot, qurls []string, body map[string]interface{}, extra map[string]string, onDelta func(Delta)) (bool, error) {
 	var lastErr error
 	emittedAny := false
 	for attempt := 0; attempt <= TransientMaxRetries; attempt++ {
@@ -664,11 +835,14 @@ func (b *Bridge) streamWithTransientRetry(ctx context.Context, slot *Slot, qurl 
 			}
 			onDelta(d)
 		}
-		streamErr := slot.client.openStreamLines(ctx, qurl, body, extra,
-			deltaDispatcher(onDeltaWrapped, &upstreamErr))
+		// 端点候选之间的故障转移在 openStreamCandidates 内完成：
+		// 只有连接阶段失败才会换端点；一旦开始投递内容就不换（避免重复内容）。
+		streamErr := slot.client.openStreamCandidates(ctx, "chat_stream", qurls, body, extra,
+			deltaDispatcherWithHook(onDeltaWrapped, &upstreamErr,
+				func(err error) { slot.client.noteRisk(err, modelKeyFromBody(body)) }))
 		if upstreamErr == nil && streamErr == nil {
-			// 上游正常关流但未发出任何有效 delta/usage 帧：对齐 hub
-			// "empty upstream stream" 显式报错（不纳入重开闸门）。
+			// 上游正常关流但未发出任何有效 delta/usage 帧：按
+			// "empty upstream stream" 约定显式报错（不纳入重开闸门）。
 			if !emitted {
 				return emittedAny, ErrEmptyStream
 			}
@@ -804,7 +978,7 @@ var defaultModelMapping = map[string]string{
 	"gemini": "gmodel",
 }
 
-// MapModel 解析顺序（参考 ccx 的 RedirectModel 算法）：
+// MapModel 解析顺序（账号维度优先、双向 substring 模糊匹配兜底）：
 //  1. 用户 Settings.ModelMappings[agent] 精确命中
 //  2. 用户 Settings.ModelMappings[agent] 双向 substring 模糊匹配（按 source 长度倒序，最长优先）
 //  3. 用户旧 Settings.ModelMapping (deprecated 扁平表) 命中

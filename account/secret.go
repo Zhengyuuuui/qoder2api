@@ -58,12 +58,32 @@ func normalizeSecret(raw string) string {
 	return s
 }
 
+// SaveSecret 保存账号凭证。
+//
+// 顺带清除该账号的 needs_reauth 标志：写入新凭证意味着用户已经重新
+// 授权 / 重新导入，之前「凭证过期」的判断已不再成立。集中在这里处理，
+// 是因为这是所有重新授权路径（OAuth 登录、PAT 导入、token 刷新后回写）
+// 的唯一汇合点——漏掉任何一条都会让账号一直「需重新授权」而无法恢复。
 func SaveSecret(accountID, secret string) error {
 	path, err := secretPath(accountID)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(normalizeSecret(secret)), 0600)
+	if err := os.WriteFile(path, []byte(normalizeSecret(secret)), 0600); err != nil {
+		return err
+	}
+	clearNeedsReauth(accountID)
+	return nil
+}
+
+// clearNeedsReauth 清除账号的 needs_reauth 标志（账号文件不存在时忽略）。
+func clearNeedsReauth(accountID string) {
+	acct, err := Get(accountID)
+	if err != nil || acct == nil || !acct.NeedsReauth {
+		return
+	}
+	acct.NeedsReauth = false
+	_ = Save(acct)
 }
 
 func GetSecret(accountID string) (string, error) {

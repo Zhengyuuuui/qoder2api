@@ -30,7 +30,7 @@ func ExtractDelta(dataLine string) Delta {
 		logger.Debug("[delta] unmarshal wrapper failed: %v, raw=%s", err, dataLine)
 		return Delta{}
 	}
-	// ---- 信封状态检查（第 3 步，hub iter_inner_sse 形态） ----
+	// ---- 信封状态检查（SSE 信封协议形态） ----
 	// 上游帧：data:{"headers":{...},"body":"<内层 chunk>","statusCodeValue":200}
 	// 关键形态：上游 HTTP200 建流后，把 provider 故障包在信封里投递
 	// statusCodeValue=418/5xx（access log 记 200 而业务错的根因）。

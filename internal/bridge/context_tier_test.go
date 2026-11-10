@@ -116,8 +116,8 @@ func TestContextTierTokensLookup(t *testing.T) {
 		{"qmodel_38max", "400K", 400000},
 		{"qmodel_38max", "1M", 1000000},
 		{"qmodel_38max", "200K", 200000},
-		{"qmodel_38max", "8M", 0},   // 不存在的档位
-		{"other_model", "400K", 0},  // 不存在的模型
+		{"qmodel_38max", "8M", 0},        // 不存在的档位
+		{"other_model", "400K", 0},       // 不存在的模型
 		{"QMODEL_38MAX", "400k", 400000}, // 大小写不敏感
 	}
 	for _, c := range cases {

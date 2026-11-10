@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"qoder2api/account"
+	"qoder2api/internal/bridge"
 	"qoder2api/internal/cosy"
 	"qoder2api/logger"
 )
@@ -153,9 +154,20 @@ func refreshAccount(acct *account.Account, force bool) RefreshReport {
 
 	// 用与本账号既有的指纹种子一致的方式派生机器头，避免指纹漂移。
 	// service.go 中 buildRegionPool 之前也是用 credential 作 seed。
+	//
+	// 出口按区域代理：续期发生在「账号 ID 之前」的阶段（还没有账号级代理
+	// 可绑），只能按区域绑定——直连会与对话流量形成双出口画像。
 	ep := account.GetEndpoints(acct.Region)
+	binding := bridge.ResolveRegionProxyBinding(string(acct.Region))
+	if binding.ConfigErr != nil {
+		rep.Status = "failed"
+		rep.Message = fmt.Sprintf("区域代理配置非法，拒绝续期（直连会暴露真实出口）: %v", binding.ConfigErr)
+		return rep
+	}
+	client := bridge.HTTPClientForKey("region|"+string(acct.Region), binding.URL, 15*time.Second)
 	seed := cosy.FingerprintSeed("", cred)
-	jt, err := cosy.ExchangeJobToken(
+	jt, err := cosy.ExchangeJobTokenWithClient(
+		client,
 		cred,
 		cosy.DeriveMachineID(seed),
 		cosy.DeriveMachineToken(seed),
@@ -321,11 +333,11 @@ func handleRefreshStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"enabled":         enabled,
-		"interval_days":   RefreshIntervalDays,
-		"window_days":     refreshWindowDays,
-		"reports":         reports,
-		"token_age_days":  ages,
+		"enabled":        enabled,
+		"interval_days":  RefreshIntervalDays,
+		"window_days":    refreshWindowDays,
+		"reports":        reports,
+		"token_age_days": ages,
 	})
 }
 
@@ -347,10 +359,10 @@ func handleRefreshRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"reports":  reports,
-		"renewed":  renewed,
-		"failed":   failed,
-		"total":    len(reports),
+		"reports":          reports,
+		"renewed":          renewed,
+		"failed":           failed,
+		"total":            len(reports),
 		"restart_required": renewed > 0,
 	})
 }

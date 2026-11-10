@@ -58,12 +58,26 @@ func (s *Service) LoadRuntimeSettings() {
 	}
 	s.bridgeToken = settings.BridgeToken
 	// 排队重试参数（控制台可配）：启动时应用，保存设置时再由 handleSaveSettings 热更新
-	bridge.ApplyQueueSettings(settings.QueueMaxRetries, settings.QueueWaitCapSec, settings.QueueWaitDefaultSec, settings.EffectiveQueueWaitFirstToken())
+	bridge.ApplyQueueSettings(settings.QueueMaxRetries, settings.QueueWaitCapSec, settings.QueueWaitDefaultSec, settings.EffectiveQueueWaitFirstToken(), settings.QueueWaitBudgetSec)
+	// 模型级冷却 / 熔断降权开关：启动时应用，保存设置时热更新
+	bridge.ApplyHealthSettings(settings.EffectiveModelCooldown(), settings.EffectiveBreakerDegrade())
+	// 签到防风控参数：启动时应用，保存设置时热更新
+	s.ApplyCheckinSettings(settings)
+}
+
+// ApplyCheckinSettings 应用签到防风控参数（控制台保存设置后调用，即时生效）。
+func (s *Service) ApplyCheckinSettings(st *account.Settings) {
+	if st == nil {
+		return
+	}
+	ApplyCheckinSettings(st.CheckinAccountGapMS, st.CheckinJitterMS, st.CheckinStaggerSec,
+		st.EffectiveCheckinStagger())
+	CheckinFullDeviceHeaders = st.CheckinFullDeviceHeaders
 }
 
 // ApplyQueueSettings 热更新模型排队重试参数（控制台保存设置后调用，即时生效）。
-func (s *Service) ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec int, waitFirstToken bool) {
-	bridge.ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec, waitFirstToken)
+func (s *Service) ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec int, waitFirstToken bool, budgetSec int) {
+	bridge.ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec, waitFirstToken, budgetSec)
 }
 
 // RecentWaitLog 返回最近排队等待记录（最新在前），供控制台「最近等待记录」面板使用。
@@ -89,9 +103,15 @@ func (s *Service) ListAccounts() []account.Account {
 func (s *Service) AddAccountByPAT(pat, region string) (*account.Account, error) {
 	r := account.NormalizeRegion(region)
 	ep := account.GetEndpoints(r)
-	// 交换时尚无 uid：机器头按凭证稳定派生，避免每次导入生成新机器码
+	// 交换时尚无 uid：机器头按凭证稳定派生，避免每次导入生成新机器码。
+	// 出口按区域代理（账号 ID 之前的阶段，见 bridge.regionProxyBinding）。
+	binding := bridge.ResolveRegionProxyBinding(string(r))
+	if binding.ConfigErr != nil {
+		return nil, fmt.Errorf("区域代理配置非法，拒绝导入（直连会暴露真实出口）: %w", binding.ConfigErr)
+	}
+	client := bridge.HTTPClientForKey("region|"+string(r), binding.URL, 15*time.Second)
 	seed := cosy.FingerprintSeed("", pat)
-	jt, err := cosy.ExchangeJobToken(pat, cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed), ep.JobTokenURL)
+	jt, err := cosy.ExchangeJobTokenWithClient(client, pat, cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed), ep.JobTokenURL)
 	if err != nil {
 		return nil, fmt.Errorf("验证 PAT 失败: %w", err)
 	}
@@ -118,6 +138,10 @@ func (s *Service) AddAccountByPAT(pat, region string) (*account.Account, error) 
 }
 
 func (s *Service) DeleteAccount(id string) error {
+	// 清理该账号的出口客户端缓存与出口登记：缓存只增不减会残留 Transport
+	// （含空闲连接），出口登记残留会让诊断接口继续展示已删除账号。
+	bridge.ForgetAccountClients(id)
+	bridge.ForgetEgress(id)
 	_ = account.DeleteSecret(id)
 	return account.Delete(id)
 }
@@ -304,8 +328,11 @@ func (s *Service) startBridgeWithAccount(acct *account.Account) error {
 	mux.HandleFunc("/v1/models", b.HandleListModels)
 	mux.HandleFunc("/v1/responses", b.HandleCodexResponses)
 
-	// mux 外包鉴权中间件：同网络客户端必须携带有效 token 才能消耗账号配额
-	handler := s.authMiddleware(mux)
+	// mux 外包鉴权中间件：同网络客户端必须携带有效 token 才能消耗账号配额。
+	// 再外层包请求体体积限制：超大请求在转发前就地被 413 挡掉——上游对
+	// 超大体会直接断连（客户端只看到 broken pipe）并连锁触发熔断，
+	// 误伤账号；本地拦截失败可读、无连锁（见 internal/bridge/limits.go）。
+	handler := bridge.BodyLimitMiddleware(s.authMiddleware(mux))
 
 	s.bridgeMu.Lock()
 	s.bridge = b
@@ -350,7 +377,7 @@ func (s *Service) startGlobalBridge(templateBase map[string]interface{}) error {
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf("0.0.0.0:%d", s.globalPort),
-		Handler: s.authMiddleware(mux),
+		Handler: bridge.BodyLimitMiddleware(s.authMiddleware(mux)),
 	}
 
 	s.bridgeMu.Lock()
@@ -387,12 +414,26 @@ func (s *Service) buildRegionPool(region account.Region) *bridge.Pool {
 			logger.Error("buildRegionPool(%s): get secret for %s: %v", region, a.Name, err)
 			continue
 		}
-		slot, err := bridge.NewSlotFromSecretWithFP(a.ID, a.Name, a.Region, pat, a.CheckinFingerprint)
+		slot, err := bridge.NewSlotFromSecretWithProxy(a.ID, a.Name, a.Region, pat, a.CheckinFingerprint, a.Proxy)
 		if err != nil {
 			logger.Error("buildRegionPool(%s): account %s unusable, skipped: %v", region, a.Name, err)
 			continue
 		}
 		pool.Add(slot)
+		// 已标记「需重新授权」的账号不参与选号（凭证真过期时，等待毫无意义）。
+		// 这里从账号文件恢复该标志，使「凭证过期」在重启后依然有效。
+		if a.NeedsReauth {
+			pool.MarkNeedsReauth(a.ID, "restored from account file (needs re-auth)")
+		}
+		// 持久化该账号的设备身份：签到路径拿不到 uid，无法自己派生出一份
+		// 与推理一致的设备身份。没有这份持久化，签到与推理就会用两套身份
+		// （上游看到的是同一账号在两台设备上活动）。
+		if a.DeviceIdentity == nil {
+			if ident := slot.SlotDeviceIdentity(); ident != nil {
+				a.DeviceIdentity = ident
+				_ = account.Save(&a)
+			}
+		}
 		if a.CheckinFingerprint != nil && a.CheckinFingerprint.MachineToken != "" {
 			logger.Info("buildRegionPool(%s): added account %s (modern protocol)", region, a.Name)
 		} else {
@@ -412,6 +453,30 @@ func (s *Service) PoolStatus() []bridge.SlotStatus {
 		return nil
 	}
 	return pool.Status()
+}
+
+// IdentityAudit 设备身份一致性审计（只读 + 快照维护，不发上游请求）。
+// 桥未启动时返回 nil（没有账号可审）。
+func (s *Service) IdentityAudit() []bridge.IdentityAuditRow {
+	s.bridgeMu.Lock()
+	pool := s.pool
+	s.bridgeMu.Unlock()
+	if pool == nil {
+		return nil
+	}
+	return pool.AuditIdentities()
+}
+
+// PoolSummary 返回账号池状态汇总（多少账号在冷却 / 熔断 / 降权）。
+// 桥未启动时返回空汇总（total=0）。
+func (s *Service) PoolSummary() bridge.PoolSummary {
+	s.bridgeMu.Lock()
+	pool := s.pool
+	s.bridgeMu.Unlock()
+	if pool == nil {
+		return bridge.PoolSummary{}
+	}
+	return pool.Summary()
 }
 
 // CoolAccount 手动冷却指定账号（运维/调试用，便于观察选号与换号）。
@@ -468,9 +533,15 @@ func (s *Service) GetAccountQuota(accountID string) (*account.QuotaInfo, error) 
 	if strings.HasPrefix(deviceToken, "dt-") {
 		token = deviceToken
 	} else {
+		// 交换按区域代理出口（账号 ID 之前的阶段）；配置非法时拒绝而不是直连
 		ep := account.GetEndpoints(acct.Region)
+		binding := bridge.ResolveRegionProxyBinding(string(acct.Region))
+		if binding.ConfigErr != nil {
+			return nil, fmt.Errorf("区域代理配置非法，拒绝查询额度（直连会暴露真实出口）: %w", binding.ConfigErr)
+		}
+		client := bridge.HTTPClientForKey("region|"+string(acct.Region), binding.URL, 15*time.Second)
 		seed := cosy.FingerprintSeed("", token)
-		jt, err := cosy.ExchangeJobToken(token, cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed), ep.JobTokenURL)
+		jt, err := cosy.ExchangeJobTokenWithClient(client, token, cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed), ep.JobTokenURL)
 		if err != nil {
 			return nil, fmt.Errorf("exchange token: %w", err)
 		}

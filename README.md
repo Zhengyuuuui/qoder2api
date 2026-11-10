@@ -272,6 +272,40 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 
 ## 更新记录
 
+### 🔐 安全加固：代理非法即拒、指纹可回退、封控默认开（2026-11-10）
+
+**2026-11-10 CST**
+
+一批「故障时行为比失败更糟」的问题修复：
+
+| # | 问题 | 修复 |
+|---|------|------|
+| P1-1 | 账号/区域代理配置非法（socks5、无 host、乱串）时**静默直连**，真实出口直接暴露给上游 | 配置非法 → 账号标记「代理配置错误」并**不参与选号**（绝不直连）；诊断接口高亮原因与修法。未配置代理仍合法直连 |
+| P1-2 | 存量部署升级后**指纹整体漂移**（新机器码 = 上游眼中的新设备） | 新增 `QD_NO_MACHINE_SALT=1`：不生成/不使用本机盐，派生结果与升级前**逐字节一致**；与 `QD_DEVICE_ID_LEGACY`（管形态）正交。审计接口区分「人为切换盐开关」与「指纹漂移」 |
+| P1-3 | `traffic_guard` / `auto_throttle` / `session_affinity` 早期是 `bool`，存量 settings.json 缺字段读成 `false`——「宣称有保护、实际没开」 | 改 `*bool`：**缺省 = 开**，显式 `false` 才关。启动时有账号且三个全关时 ERROR 告警 |
+| P1-4 | 租约 10 分钟固定 TTL，长流（思考停顿 > 10min）被误回收，**并发上限被击穿** | 改心跳续租（`TouchLease`）+ TTL 从 `lastHeartbeat` 起算（`lease_ttl_sec`，默认 2h）；停止心跳超时才回收 |
+| P1-5 | 签到 / token 交换 / 额度查询**直连**，与对话流量形成双出口画像 | 账号 ID 之前的流量按区域代理出口；同账号签到与对话**共用同一 Transport**；配置非法同样拒绝不直连 |
+| P2-1 | 闸门 fail-open 无上限，持续过载时等待请求全放行 → 并发限制形同虚设 | 软放行加每分钟上限（limit×2，下限 2），耗尽后拒流（503）；计数在诊断接口可见 |
+| P2-2 | settings.json 每请求读盘（~7 次/请求）且非原子写 | mtime+size 缓存 + 原子写（tmp+rename）；并发保存不再互相踩踏 |
+| P2-3 | `/health` 暴露**完整账号 ID** | 出口诊断账号 ID 截断到前 8 位 |
+| P2-4 | 「首字前一直等」默认开且**无总时间上限**，客户端连接与账号配额被无限占用 | 新增 `queue_wait_budget_sec`（默认 30min）总预算，耗尽按 503 上抛；ctx 取消立即返回 |
+| P2-5 | 代理 URL 的 path/query（可能藏 API key 段）在日志/错误里明文出现 | 脱敏只保留 `scheme://user:***@host:port`，path/query 一律丢弃 |
+| P3 | `wrapProxyError` 误把非代理拨号错误标成「代理不可达」；嵌套 430 版本门禁漏判；删除账号残留客户端/出口登记；死代码 | 全部修复 |
+
+**升级注意**：
+- 老部署若升级后上游把账号当新设备（模型清单异常 / 风控收紧），设 `QD_NO_MACHINE_SALT=1`
+  即可回到升级前的指纹基准（派生值逐字节一致）。
+- 三个封控开关改为「缺省开」：旧配置缺字段现在等于开启，无需改任何文件；
+  想关必须在 settings.json / 控制台显式设 `false`。
+- 代理配置（账号级 `proxy` / `QD_ACCOUNT_PROXY_<ID前8位>` / 区域级 `QD_PROXY_CN` /
+  `QD_PROXY_GLOBAL`）只支持 `http/https`；配了 socks5 的账号会停用并在诊断页给出提示，
+  需先经本地 http 转发层。
+
+**回归测试**：`internal/bridge/{guard_test,proxy_test,proxy_config_test,region_egress_test,
+queue_budget_test,risk_test,identity_test}.go`、`account/protection_defaults_test.go`、
+`internal/cosy/fingerprint_test.go`、`checkin_proxy_test.go`、`service_proxy_test.go`、
+`settings_handlers_test.go`、`diagnostics_test.go`。
+
 ### 🐛 修复：CALL_COUNT_LIMIT 排队报文被预筛选漏掉（2026-10-27）
 
 **2026-10-27 CST**

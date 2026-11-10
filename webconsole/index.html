@@ -214,6 +214,17 @@
       <div class="row" id="statusMeta"></div>
     </section>
 
+    <section class="card" id="riskCard" style="display:none">
+      <h3>风险信号 <span class="muted" style="font-size:12px">（上游拒绝 / 拥塞计数，用于判断调参是变好还是变差）</span></h3>
+      <div class="row" id="riskCounts" style="gap:8px"></div>
+      <div class="muted" style="font-size:12px; margin-top:10px" id="riskLast">暂无风险信号</div>
+    </section>
+
+    <section class="card" id="egressCard" style="display:none">
+      <h3>出口与端点 <span class="muted" style="font-size:12px">（按区域分组的出口配置、上游端点健康状态）</span></h3>
+      <div id="egressBox" style="font-size:12px"></div>
+    </section>
+
     <section class="card">
       <h3>添加账号</h3>
       <div class="grid-2">
@@ -336,6 +347,48 @@
     </section>
 
     <section class="card">
+      <h3>账号健康策略 <span class="muted" style="font-size:12px">（模型级冷却 / 熔断降权：影响账号池的隔离与退避行为）</span></h3>
+      <div class="row" style="gap:8px; flex-wrap:wrap; align-items:center">
+        <label class="pill" style="cursor:pointer; margin-bottom:0">
+          <input type="checkbox" id="modelCooldownToggle" style="width:auto; margin-right:6px" checked>
+          模型级冷却（429/排队只冷却该模型，不整号拖死）
+        </label>
+        <label class="pill" style="cursor:pointer; margin-bottom:0">
+          <input type="checkbox" id="breakerDegradeToggle" style="width:auto; margin-right:6px" checked>
+          熔断 / 降权（连续失败指数退避，避免反复唤醒账号）
+        </label>
+        <button class="secondary" id="saveHealthBtn">保存健康策略</button>
+        <span class="msg" id="healthMsg"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>签到防风控 <span class="muted" style="font-size:12px">（账号间隔 + 时间点错峰：批量同秒签到是明显的自动化特征）</span></h3>
+      <div class="row" style="gap:8px; flex-wrap:wrap; align-items:center">
+        <span style="font-size:12px">账号间隔</span>
+        <input id="checkinGapInput" type="number" min="0" max="600000" placeholder="1000" style="width:90px" />
+        <span style="font-size:12px">ms · 抖动</span>
+        <input id="checkinJitterInput" type="number" min="0" max="600000" placeholder="500" style="width:90px" />
+        <span style="font-size:12px">ms · 错峰窗口</span>
+        <input id="checkinStaggerInput" type="number" min="0" max="3600" placeholder="60" style="width:90px" />
+        <span style="font-size:12px">秒</span>
+        <label class="pill" style="cursor:pointer; margin-bottom:0">
+          <input type="checkbox" id="checkinStaggerToggle" style="width:auto; margin-right:6px" checked>
+          错峰（按账号固定偏移）
+        </label>
+        <label class="pill" style="cursor:pointer; margin-bottom:0">
+          <input type="checkbox" id="checkinFullDeviceToggle" style="width:auto; margin-right:6px">
+          签到带完整设备头
+        </label>
+        <button class="secondary" id="saveCheckinAntiRiskBtn">保存签到设置</button>
+        <span class="msg" id="checkinAntiRiskMsg"></span>
+      </div>
+      <div class="muted" style="font-size:11px; margin-top:6px">
+        错峰偏移由账号 ID 派生（跨天稳定，不会逐日漂移）；关闭错峰会回到「所有账号同一秒打」的旧行为。
+      </div>
+    </section>
+
+    <section class="card">
       <h3>NewAPI / 中转站接入</h3>
       <div class="muted" style="margin-bottom:12px">
         把下面地址和密钥填到 NewAPI 渠道（OpenAI 兼容）。本地默认只监听 127.0.0.1。
@@ -397,6 +450,8 @@
     let currentLoginID = '';
     let oauthAbort = false;
     const quotaCache = {};
+    // 最近一次拉取的账号列表（供「出口代理」等操作回读当前配置）。
+    let accountsCache = [];
 
     async function api(path, options = {}) {
       const res = await fetch(path, {
@@ -451,6 +506,29 @@
       }
       if (document.activeElement !== $('queueWaitFirstTokenInput')) {
         $('queueWaitFirstTokenInput').checked = !!settings.queue_wait_first_token;
+      }
+      // 账号健康策略开关：未设置时后端返回默认（开启）
+      if (document.activeElement !== $('modelCooldownToggle')) {
+        $('modelCooldownToggle').checked = settings.model_cooldown !== false;
+      }
+      // 签到防风控参数：留空/0 显示为默认值
+      if (document.activeElement !== $('checkinGapInput')) {
+        $('checkinGapInput').value = Number(settings.checkin_account_gap_ms) > 0 ? settings.checkin_account_gap_ms : 1000;
+      }
+      if (document.activeElement !== $('checkinJitterInput')) {
+        $('checkinJitterInput').value = Number(settings.checkin_jitter_ms) > 0 ? settings.checkin_jitter_ms : 500;
+      }
+      if (document.activeElement !== $('checkinStaggerInput')) {
+        $('checkinStaggerInput').value = Number(settings.checkin_stagger_sec) > 0 ? settings.checkin_stagger_sec : 60;
+      }
+      if (document.activeElement !== $('checkinStaggerToggle')) {
+        $('checkinStaggerToggle').checked = settings.checkin_stagger !== false;
+      }
+      if (document.activeElement !== $('checkinFullDeviceToggle')) {
+        $('checkinFullDeviceToggle').checked = !!settings.checkin_full_device_headers;
+      }
+      if (document.activeElement !== $('breakerDegradeToggle')) {
+        $('breakerDegradeToggle').checked = settings.breaker_degrade !== false;
       }
       const cfg = {
         name: 'QCCG / Qoder',
@@ -676,13 +754,39 @@
             ? `<span class="pill" style="border-color:#e6b800;background:#fff8e1;color:#8a6d00">冷却中 ${fmtDur(coolMs)}</span>`
             : `<span class="pill" style="border-color:#8bc34a;background:#f1f8e9;color:#33691e">可用</span>`)
           : '';
+        // 熔断 / 降权 / 模型级冷却徽标：反映账号池的健康状态，
+        // 便于判断「换号了但还是失败」是不是账号本身出了问题。
+        let slotBadges = '';
+        if (slot) {
+          if (slot.breaker_for > 0) {
+            slotBadges += `<span class="pill" style="border-color:#f0c2c6;background:#fff5f5;color:#cf222e">熔断 ${slot.breaker_for}s</span>`;
+          }
+          if (slot.degrade_for > 0) {
+            slotBadges += `<span class="pill" style="border-color:#e6b800;background:#fff8e1;color:#8a6d00">降权 ${slot.degrade_for}s</span>`;
+          }
+          const modelCds = slot.model_cooldowns || {};
+          const modelKeys = Object.keys(modelCds);
+          if (modelKeys.length) {
+            slotBadges += `<span class="pill" style="border-color:#e6b800;background:#fff8e1;color:#8a6d00">模型冷却 ${modelKeys.length}</span>`;
+          }
+        }
         const poolNote = (slot && coolMs > 0 && slot.last_error)
           ? `<div class="muted" style="font-size:11px">${slot.last_error}</div>` : '';
+        // 出口代理徽标：只显示 host，不显示凭据（密码不进控制台）。
+        const proxyBadge = a.proxy
+          ? `<span class="pill" title="账号绑定的出口代理">出口 ${a.proxy.replace(/\/\/[^@]*@/, '//***@')}</span>`
+          : '';
+        // 需重新授权徽标：凭证真过期时等冷却没有意义，必须提示用户重新登录。
+        const reauthBadge = a.needs_reauth
+          ? `<span class="pill" style="border-color:#f0c2c6;background:#fff5f5;color:#cf222e">需重新授权</span>`
+          : '';
         return `
         <tr data-id="${a.id}">
           <td>
-            <div><strong>${a.name || a.id}</strong> ${a.active ? '<span class="pill">启用</span>' : ''} ${poolBadge}</div>
+            <div><strong>${a.name || a.id}</strong> ${a.active ? '<span class="pill">启用</span>' : ''} ${poolBadge} ${reauthBadge}</div>
             <div class="muted">${a.email || '-'}</div>
+            ${slotBadges ? `<div class="row" style="gap:4px; margin-top:4px">${slotBadges}</div>` : ''}
+            ${proxyBadge ? `<div style="margin-top:4px">${proxyBadge}</div>` : ''}
             ${poolNote}
           </td>
           <td>
@@ -696,6 +800,7 @@
             <button class="secondary" data-act="quota" data-id="${a.id}">刷新额度</button>
             <button class="secondary" data-act="checkin" data-id="${a.id}">🎁 签到</button>
             <button class="secondary" data-act="cool" data-id="${a.id}">冷却</button>
+            <button class="secondary" data-act="proxy" data-id="${a.id}">出口代理</button>
             <button class="danger" data-act="delete" data-id="${a.id}">删除</button>
           </td>
         </tr>
@@ -832,6 +937,105 @@
       }
     }
 
+    // 风险信号计数的中文标签（未列出的类型回落到原始 key）。
+    const riskLabels = {
+      queue: '模型排队',
+      rate: '频控 429',
+      rejected: '凭证/额度拒绝',
+      version_gate: '版本闸门 430',
+    };
+
+    // loadRisk 拉取风控遥测并渲染风险面板。
+    // 优雅降级：后端没返回 risk 字段（旧版本后端）时隐藏整块面板，
+    // 不报错、不显示空白块。
+    async function loadRisk() {
+      const card = $('riskCard');
+      if (!card) return;
+      try {
+        const data = await api('/health');
+        const risk = (data && data.risk) || null;
+        if (!risk) {
+          card.style.display = 'none';
+          return;
+        }
+        card.style.display = '';
+        const counts = $('riskCounts');
+        const keys = ['queue', 'rate', 'rejected', 'version_gate'];
+        const chips = keys.map(k => {
+          const n = Number(risk[k]) || 0;
+          const cls = n > 0 ? 'pill' : 'pill muted';
+          return `<span class="${cls}">${riskLabels[k] || k}: ${n}</span>`;
+        });
+        counts.innerHTML = chips.join('');
+
+        const last = risk.last;
+        const box = $('riskLast');
+        if (!last) {
+          box.textContent = '暂无风险信号';
+          return;
+        }
+        const t = last.at ? new Date(last.at).toLocaleString() : '-';
+        const type = riskLabels[last.type] || last.type || '-';
+        const detail = last.detail ? String(last.detail).slice(0, 200) : '';
+        box.innerHTML = `最近一次：<b>${type}</b> · 模型 ${last.model || '-'} · 账号 ${last.account || '-'} · ${t}` +
+          (detail ? `<br><span class="muted">${detail}</span>` : '');
+      } catch (e) {
+        // 拉取失败就隐藏面板（不留空白块）
+        card.style.display = 'none';
+      }
+    }
+
+    // loadEgress 拉取出口配置与端点健康状态并渲染。
+    // 优雅降级：后端没返回这些字段时隐藏整块面板。
+    async function loadEgress() {
+      const card = $('egressCard');
+      if (!card) return;
+      try {
+        const data = await api('/health');
+        const egress = (data && data.egress) || [];
+        const endpoints = (data && data.endpoints) || [];
+        if (!egress.length && !endpoints.length) {
+          card.style.display = 'none';
+          return;
+        }
+        card.style.display = '';
+        const box = $('egressBox');
+        let html = '';
+
+        if (egress.length) {
+          html += '<div style="margin-bottom:10px"><b>出口（按区域）</b></div>';
+          for (const r of egress) {
+            const warn = r.shared_warning || r.no_dedicated_egress || '';
+            html += `<div style="margin-bottom:8px">` +
+              `<div><span class="pill">${r.region}</span> ` +
+              `<span class="muted">独立出口数 ${r.unique_egress}</span></div>`;
+            for (const a of (r.accounts || [])) {
+              const eg = a.direct ? '直连' : (a.egress || '-');
+              html += `<div class="muted" style="padding-left:6px">· ${a.account_id} → ${eg}</div>`;
+            }
+            if (warn) {
+              html += `<div class="msg err" style="margin-top:4px">${warn}</div>`;
+            }
+          }
+        }
+
+        if (endpoints.length) {
+          html += '<div style="margin:10px 0 6px"><b>上游端点健康</b></div><table style="width:100%;border-collapse:collapse">';
+          html += '<thead><tr style="text-align:left;color:var(--muted)"><th>用途</th><th>端点</th><th>失败</th><th>成功</th><th>冷却剩余</th></tr></thead><tbody>';
+          for (const e of endpoints) {
+            const host = String(e.url || '').replace(/^https?:\/\//, '').split('/')[0];
+            const cool = e.cooling_remaining_ms > 0 ? fmtDur(e.cooling_remaining_ms) : '-';
+            html += `<tr><td>${e.purpose}</td><td>${host}</td><td>${e.fails || 0}</td>` +
+              `<td>${e.successes || 0}</td><td>${cool}</td></tr>`;
+          }
+          html += '</tbody></table>';
+        }
+        box.innerHTML = html;
+      } catch (e) {
+        card.style.display = 'none';
+      }
+    }
+
     async function refresh() {
       try {
         const status = await api('/api/status');
@@ -842,11 +1046,14 @@
 
       await loadConnection();
       loadWaitLog();
+      loadRisk();
+      loadEgress();
 
       try {
         let pool = null;
         try { pool = await api('/api/pool'); } catch (e) {}
         const accounts = await api('/api/accounts');
+        accountsCache = accounts || [];
         renderAccounts(accounts, pool);
         // 并行拉额度
         (accounts || []).forEach(a => loadQuota(a.id));
@@ -1028,6 +1235,45 @@
       } catch (e) {
         $('queueMsg').className = 'msg err';
         $('queueMsg').textContent = e.message;
+      }
+    };
+
+    $('saveHealthBtn').onclick = async () => {
+      $('healthMsg').className = 'msg';
+      $('healthMsg').textContent = '保存中...';
+      try {
+        await api('/api/settings/save', {
+          method: 'POST',
+          body: JSON.stringify({
+            model_cooldown: $('modelCooldownToggle').checked,
+            breaker_degrade: $('breakerDegradeToggle').checked,
+          }),
+        });
+        $('healthMsg').className = 'msg ok';
+        $('healthMsg').textContent = '已保存，即时生效';
+      } catch (e) {
+        $('healthMsg').className = 'msg err';
+        $('healthMsg').textContent = e.message;
+      }
+    };
+
+    $('saveCheckinAntiRiskBtn').onclick = async () => {
+      $('checkinAntiRiskMsg').className = 'msg';
+      $('checkinAntiRiskMsg').textContent = '保存中...';
+      const body = {
+        checkin_account_gap_ms: Number($('checkinGapInput').value) || 0,
+        checkin_jitter_ms: Number($('checkinJitterInput').value) || 0,
+        checkin_stagger_sec: Number($('checkinStaggerInput').value) || 0,
+        checkin_stagger: $('checkinStaggerToggle').checked,
+        checkin_full_device_headers: $('checkinFullDeviceToggle').checked,
+      };
+      try {
+        await api('/api/settings/save', { method: 'POST', body: JSON.stringify(body) });
+        $('checkinAntiRiskMsg').className = 'msg ok';
+        $('checkinAntiRiskMsg').textContent = '已保存，即时生效';
+      } catch (e) {
+        $('checkinAntiRiskMsg').className = 'msg err';
+        $('checkinAntiRiskMsg').textContent = e.message;
       }
     };
 
@@ -1218,6 +1464,19 @@
           const secs = parseInt(prompt('冷却该账号多少秒？（默认 300）', '300'), 10);
           if (!secs || secs <= 0) return;
           await api('/api/pool/cool', { method: 'POST', body: JSON.stringify({ id, seconds: secs, reason: 'manual' }) });
+          await refresh();
+        } else if (act === 'proxy') {
+          // 出口代理：留空 = 直连。只支持 http/https（socks5 需额外依赖，
+          // 当前未实现，后端会明确报错而不是静默直连）。
+          const acct = (accountsCache || []).find(x => x.id === id);
+          const cur = (acct && acct.proxy) || '';
+          const next = prompt(
+            `为账号 ${(acct && (acct.name || acct.id)) || id} 设置出口代理：\n` +
+            '留空 = 直连；仅支持 http:// 或 https://（socks5 当前未实现）。\n' +
+            '也可用环境变量 QD_ACCOUNT_PROXY_<账号ID前8位> 临时覆盖。',
+            cur);
+          if (next === null) return;
+          await api('/api/accounts/proxy', { method: 'POST', body: JSON.stringify({ id, proxy: next.trim() }) });
           await refresh();
         } else if (act === 'delete') {
           if (!confirm('确认删除该账号？')) return;

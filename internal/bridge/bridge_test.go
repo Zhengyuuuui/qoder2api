@@ -14,9 +14,12 @@ import (
 	"qoder2api/internal/cosy"
 )
 
-// envelopeBridge 构造指向测试服务器的 Bridge（隔离 settings，避免读写真实配置）。
+// envelopeBridge 构造指向测试服务器的 Bridge（隔离 settings，避免读写真实配置；
+// 隔离后 LoadSettings 返回默认值——流量闸门默认开启，租约经 streamWithSlot
+// 的 defer 正常释放）。
 func envelopeBridge(t *testing.T, streamURL string) *Bridge {
 	t.Helper()
+	account.SetDataRoot(t.TempDir())
 	account.SetDataRoot(t.TempDir())
 	sess, err := cosy.NewSession(
 		cosy.AuthIdentity{Uid: "env-test-uid", UserType: "personal_standard"},
@@ -45,7 +48,7 @@ func testMessages() []interface{} {
 	}
 }
 
-// sseEnvelope 生成 hub iter_inner_sse 形态的信封帧。
+// sseEnvelope 生成 SSE 信封帧（headers/body/statusCodeValue 协议形态）。
 func sseEnvelope(status int, detail string) string {
 	return fmt.Sprintf("data: {\"body\":%q,\"statusCodeValue\":%d}\n\n", detail, status)
 }
@@ -130,7 +133,7 @@ func TestCallQoderEnvelopeRetrySucceeds(t *testing.T) {
 		hits++
 		w.Header().Set("Content-Type", "text/event-stream")
 		if hits == 1 {
-			// 第一次：HTTP200 建流后信封投 418（hub 实证形态）
+			// 第一次：HTTP200 建流后信封投 418（实测形态）
 			fmt.Fprint(w, sseEnvelope(418, "provider_error: transient"))
 			return
 		}
@@ -227,7 +230,7 @@ func TestCallQoderEnvelopeRetryExhausted(t *testing.T) {
 
 // TestCallQoderEnvelopeRetryWhenUpstreamKeepsStreamOpen 回归测试（review P1-1）：
 // 上游 HTTP200 建流后先发错误信封帧（statusCodeValue=418），随后持续写入正常帧
-// 且不关闭连接——模拟 hub「错误帧后不关流」形态。修复前 openStreamLines 会一直
+// 且不关闭连接——模拟「错误帧后不关流」形态。修复前 openStreamLines 会一直
 // 阻塞读到上游关流，重开闸门永不触发；修复后 dispatcher 返回 false 即停止读取，
 // CallQoderWithOpts 必须在有限时间内完成重开，第二次请求拿到正常内容。
 func TestCallQoderEnvelopeRetryWhenUpstreamKeepsStreamOpen(t *testing.T) {
@@ -287,7 +290,7 @@ func TestCallQoderEnvelopeRetryWhenUpstreamKeepsStreamOpen(t *testing.T) {
 
 // TestCallQoderEmptyStreamReturnsError 回归测试（review P2-1）：
 // 上游 HTTP200 建流后零有效帧即关流：必须返回 ErrEmptyStream
-// （对齐 hub "empty upstream stream"），而不是空内容正常 finish。
+// （对应 "empty upstream stream" 约定），而不是空内容正常 finish。
 func TestCallQoderEmptyStreamReturnsError(t *testing.T) {
 	withFastBackoff(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -173,7 +173,7 @@ func TestFriendlyMessageRuneSafe(t *testing.T) {
 }
 
 func TestRetryBackoffSchedule(t *testing.T) {
-	// 生产退避节奏：第 1 次 1s、第 2 次 2s（与 hub 一致）
+	// 生产退避节奏：第 1 次 1s、第 2 次 2s
 	if RetryBackoff(1).Seconds() != 1 || RetryBackoff(2).Seconds() != 2 {
 		t.Errorf("backoff schedule = %v, %v", RetryBackoff(1), RetryBackoff(2))
 	}
@@ -373,7 +373,7 @@ func TestApplyQueueSettings(t *testing.T) {
 	defer func() { QueueMaxRetries, QueueWaitCap, QueueWaitDefault, QueueWaitFirstToken = omr, owc, owd, oft }()
 
 	// 全 0 → 各自默认
-	ApplyQueueSettings(0, 0, 0, false)
+	ApplyQueueSettings(0, 0, 0, false, 0)
 	if QueueMaxRetries != DefaultQueueMaxRetries ||
 		QueueWaitCap != DefaultQueueWaitCapSec*time.Second ||
 		QueueWaitDefault != DefaultQueueWaitDefSec*time.Second ||
@@ -381,12 +381,12 @@ func TestApplyQueueSettings(t *testing.T) {
 		t.Errorf("defaults not applied: %d %v %v %v", QueueMaxRetries, QueueWaitCap, QueueWaitDefault, QueueWaitFirstToken)
 	}
 	// 正常值透传（含开关）
-	ApplyQueueSettings(5, 10, 8, true)
+	ApplyQueueSettings(5, 10, 8, true, 0)
 	if QueueMaxRetries != 5 || QueueWaitCap != 10*time.Second || QueueWaitDefault != 8*time.Second || QueueWaitFirstToken != true {
 		t.Errorf("custom not applied: %d %v %v %v", QueueMaxRetries, QueueWaitCap, QueueWaitDefault, QueueWaitFirstToken)
 	}
 	// 超上限夹取
-	ApplyQueueSettings(99, 9999, 9999, false)
+	ApplyQueueSettings(99, 9999, 9999, false, 0)
 	if QueueMaxRetries != maxQueueRetriesCeiling ||
 		QueueWaitCap != maxQueueWaitCeilingSec*time.Second ||
 		QueueWaitDefault != maxQueueWaitCeilingSec*time.Second {

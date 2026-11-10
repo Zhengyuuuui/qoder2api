@@ -1,4 +1,4 @@
-// Package bridge —— 上游错误四分类与友好映射（移植自 qoder2api-hub qoder_proxy.py:2308-2398）。
+// Package bridge —— 上游错误四分类与友好映射。
 //
 // 分类语义：
 //   - 瞬时可重试：418/5xx、传输层 TLS/EOF/reset/超时、4xx 带 provider_error
@@ -34,6 +34,26 @@ const (
 	// ErrTypeUpstreamQueue 上游队列拥塞（isQueued=true 或带 retryAfterSeconds）。
 	// 属可重试的拥塞：同账号等待重试可能成功，换号无益（同模型同队列）。
 	ErrTypeUpstreamQueue = "upstream_queued"
+
+	// ---- 凭证 / 额度类细分类 ----
+	//
+	// 为什么必须细分：TOKEN_EXPIRE（凭证过期）、额度耗尽、权限不足、
+	// 试用受限这四种是完全不同的处置，压成同一个「401/403 → 冷却 30 分钟」
+	// 会导致：凭证真过期时账号静默躺 30 分钟才开始一轮注定失败的请求；
+	// 额度耗尽时 30 分钟就醒过来再撞一次额度墙。
+
+	// ErrTypeTokenExpired 凭证过期 / 需重新授权。
+	// 处置：标记账号 needs_reauth（不是冷却等重试——重试多少次都不会成功）。
+	ErrTypeTokenExpired = "token_expired"
+	// ErrTypeQuotaExhausted 额度 / 配额耗尽。
+	// 处置：账号级长冷却 + 换号（换一个账号可能还有额度）。
+	ErrTypeQuotaExhausted = "quota_exhausted"
+	// ErrTypeTrialRestricted 试用账户受限。
+	// 处置：账号级长冷却 + 换号（试用账号用不了该能力）。
+	ErrTypeTrialRestricted = "trial_restricted"
+	// ErrTypeModelNotAllowed 该模型不在此账号的套餐 / 权限范围内。
+	// 处置：不换号（同号换号无意义），直接提示用户换模型或换账号。
+	ErrTypeModelNotAllowed = "model_not_allowed"
 )
 
 // TransientMaxRetries 同账号瞬时故障额外重试次数（退避时长见 RetryBackoff）。
@@ -49,22 +69,31 @@ var (
 	// QueueWaitFirstToken 排队时「首字前一直等」：true=直到出首字或客户端断开才停
 	// （忽略 QueueMaxRetries）；false=按 QueueMaxRetries 封顶。默认开（true）。
 	QueueWaitFirstToken = true
+	// QueueWaitBudget 一次请求在排队等待上的总预算（绝对兜底）。
+	// 「首字前一直等」也不能无限挂起：上游持续排队时请求可以挂数年，
+	// 客户端连接与账号配额都被白白占用。超过预算 → 放弃等待，按
+	// ErrTypeUpstreamQueue（503）上抛，客户端稍后重试。
+	QueueWaitBudget = DefaultQueueWaitBudgetSec * time.Second
 )
 
 const (
 	DefaultQueueMaxRetries = 2  // 排队同账号最多重试次数
 	DefaultQueueWaitCapSec = 30 // 单次排队等待上限（秒）
 	DefaultQueueWaitDefSec = 15 // 上游未给 retryAfter 时的默认等待（秒）
-	maxQueueRetriesCeiling = 10 // 重试次数硬上限（防误配过长）
-	maxQueueWaitCeilingSec = 300
+	// DefaultQueueWaitBudgetSec 排队总预算默认值（秒，30 分钟）。
+	DefaultQueueWaitBudgetSec = 1800
+	maxQueueRetriesCeiling    = 10 // 重试次数硬上限（防误配过长）
+	maxQueueWaitCeilingSec    = 300
+	maxQueueBudgetCeilingSec  = 86400 // 总预算硬上限（防误配成永久等待）
 )
 
 // ApplyQueueSettings 应用控制台配置的排队重试参数到包级变量（带默认值与夹取）。
 // 启动（LoadRuntimeSettings）与保存设置后各调用一次，使改动即时生效、无需重启。
 // 入参对应 settings 的 queue_max_retries / queue_wait_cap_sec / queue_wait_default_sec /
-// queue_wait_first_token；每个时长 ≤0 时回退各自默认值。
-// waitFirstToken=true 时忽略 maxRetries，改为「首字前一直等（仅客户端断开停止）」。
-func ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec int, waitFirstToken bool) {
+// queue_wait_first_token / queue_wait_budget_sec；每个时长 ≤0 时回退各自默认值。
+// waitFirstToken=true 时忽略 maxRetries，改为「首字前一直等」，但总预算
+// （budget）始终生效——它是唯一不能让的绝对上限。
+func ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec int, waitFirstToken bool, budgetSec int) {
 	if maxRetries <= 0 {
 		maxRetries = DefaultQueueMaxRetries
 	}
@@ -75,8 +104,15 @@ func ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec int, waitFirstTok
 	QueueWaitCap = clampQueueSeconds(waitCapSec, DefaultQueueWaitCapSec)
 	QueueWaitDefault = clampQueueSeconds(waitDefaultSec, DefaultQueueWaitDefSec)
 	QueueWaitFirstToken = waitFirstToken
-	logger.Info("queue retry applied: maxRetries=%d waitCap=%s waitDefault=%s waitFirstToken=%v",
-		QueueMaxRetries, QueueWaitCap, QueueWaitDefault, QueueWaitFirstToken)
+	if budgetSec <= 0 {
+		budgetSec = DefaultQueueWaitBudgetSec
+	}
+	if budgetSec > maxQueueBudgetCeilingSec {
+		budgetSec = maxQueueBudgetCeilingSec
+	}
+	QueueWaitBudget = time.Duration(budgetSec) * time.Second
+	logger.Info("queue retry applied: maxRetries=%d waitCap=%s waitDefault=%s waitFirstToken=%v budget=%s",
+		QueueMaxRetries, QueueWaitCap, QueueWaitDefault, QueueWaitFirstToken, QueueWaitBudget)
 }
 
 func clampQueueSeconds(v, def int) time.Duration {
@@ -90,7 +126,7 @@ func clampQueueSeconds(v, def int) time.Duration {
 }
 
 // ErrEmptyStream 上游建流成功（HTTP200）但未投递任何有效 delta/usage 帧即正常关流
-// （对齐 hub "empty upstream stream"）：按约定不重试，由 CallQoderWithOpts 直接上抛，
+// （对应 "empty upstream stream" 约定）：不重试，由 CallQoderWithOpts 直接上抛，
 // 避免客户端收到空 assistant 消息却按正常 finish 结束。
 var ErrEmptyStream = errors.New("empty upstream stream")
 
@@ -217,6 +253,9 @@ type UpstreamError struct {
 	Detail  string // 上游原始详情（完整保留，供日志排查）
 	ErrType string // content_policy_rejected / upstream_transient_error / upstream_error
 	Message string // 对客户端可读的消息（已做长度截断）
+	// RiskKind 该错误对应的风控信号类型（queue / rate / rejected / version_gate）；
+	// 空串表示不构成风控信号。分类层一次性判定，避免各调用点重复推导口径。
+	RiskKind string
 }
 
 func (e *UpstreamError) Error() string { return e.Message }
@@ -361,16 +400,27 @@ func queueRetryAfter(err error) time.Duration {
 }
 
 // FriendlyUpstreamError 把上游错误转成对客户端可读的消息；瞬时故障给出重试指引。
-// 返回 (message, errType)。与 hub friendly_upstream_error 逐句对齐。
+// 返回 (message, errType)。
+//
+// 分类顺序：凭证 / 额度细分 → 嵌套业务错误 → 内容审核 → 瞬时 → 普通。
+//
+// 为什么凭证细分排在最前：凭证过期、额度耗尽、权限不足这几类错误的
+// 处置方式与「瞬时故障」完全不同（需要重新授权 / 长冷却 / 换模型），
+// 若被后面的通用分支先判掉，就会退化成「换号 + 冷却 30 分钟」的粗粒度
+// 处理——凭证真过期时那 30 分钟纯属浪费。
 func FriendlyUpstreamError(code int, detail string) (string, string) {
 	detail = strings.TrimSpace(detail)
-	// 0) 上游业务错误（三层嵌套）：RESOURCE_LIMIT / 队列等待
+	// 0) 凭证 / 额度 / 权限细分（最优先：处置方式各不相同）
+	if kind := classifyCredentialError(detail); kind != credentialNone {
+		return credentialMessage(kind, "", detail), kind.errTypeOf()
+	}
+	// 1) 上游业务错误（三层嵌套）：RESOURCE_LIMIT / 队列等待
 	if d, ok := parseUpstreamNestedError(detail); ok {
 		if msg, et, handled := resourceLimitMessage(d); handled {
 			return msg, et
 		}
 	}
-	// 1) 内容安全审核（确定性拒绝，先于瞬时判断——重试无效）
+	// 2) 内容安全审核（确定性拒绝，先于瞬时判断——重试无效）
 	if IsContentPolicy(detail) {
 		return "上游内容安全审核未通过 (DataInspectionFailed)：输入可能含不当内容，" +
 				"属确定性拒绝、重试无效。请检查/缩短输入（系统提示词、超长历史、" +
@@ -392,7 +442,8 @@ func FriendlyUpstreamError(code int, detail string) (string, string) {
 // NewUpstreamError 按 HTTP 状态 + 详情构造结构化错误并完成友好映射。
 func NewUpstreamError(code int, detail string) *UpstreamError {
 	msg, et := FriendlyUpstreamError(code, detail)
-	return &UpstreamError{Status: code, Detail: detail, ErrType: et, Message: msg}
+	return &UpstreamError{Status: code, Detail: detail, ErrType: et, Message: msg,
+		RiskKind: riskKindFor(code, detail, et)}
 }
 
 // NewStreamBusinessError 流内业务错误（HTTP 200 帧内 code != 0）：
@@ -400,9 +451,11 @@ func NewUpstreamError(code int, detail string) *UpstreamError {
 func NewStreamBusinessError(detail string) *UpstreamError {
 	if IsContentPolicy(detail) {
 		msg, et := FriendlyUpstreamError(502, detail)
-		return &UpstreamError{Status: 502, Detail: detail, ErrType: et, Message: msg}
+		return &UpstreamError{Status: 502, Detail: detail, ErrType: et, Message: msg,
+			RiskKind: riskKindFor(502, detail, et)}
 	}
-	return &UpstreamError{Status: 0, Detail: detail, ErrType: ErrTypeUpstream, Message: detail}
+	return &UpstreamError{Status: 0, Detail: detail, ErrType: ErrTypeUpstream, Message: detail,
+		RiskKind: riskKindFor(0, detail, ErrTypeUpstream)}
 }
 
 // WrapTransportError 传输层错误包装：瞬时类转成带友好消息的 UpstreamError，
@@ -436,6 +489,8 @@ func FriendlyError(err error) (string, string) {
 //   - 内容审核拒绝 → 400（用户输入问题，客户端应改输入而非重试）
 //   - 瞬时故障耗尽 → 502（不透传上游包装的 418 等无意义状态码）
 //   - 账号池全冷却 → 503（服务暂时不可用，客户端应稍后重试）
+//   - 凭证过期 → 401（客户端需要重新授权，不是服务端故障）
+//   - 额度耗尽 / 试用受限 / 模型不可用 → 403（账号侧权限或额度问题）
 //   - 其余结构化错误 → 透传上游合法 4xx/5xx
 //   - 无结构化状态 → 500
 func ErrorStatus(err error) int {
@@ -455,6 +510,17 @@ func ErrorStatus(err error) int {
 		case ErrTypeUpstreamQueue:
 			// 上游拥塞：映射 503，客户端应稍后重试
 			return 503
+		case ErrTypeTokenExpired:
+			// 凭证过期：客户端应重新授权，401 让客户端能据此触发授权流程
+			return 401
+		case ErrTypeQuotaExhausted:
+			// 额度耗尽：账号侧额度问题，403 明确不是客户端的错
+			return 403
+		case ErrTypeTrialRestricted:
+			return 403
+		case ErrTypeModelNotAllowed:
+			// 模型不在套餐内：换号无用，403 + 消息提示换模型
+			return 403
 		}
 		if ue.Status >= 400 && ue.Status <= 599 {
 			return ue.Status

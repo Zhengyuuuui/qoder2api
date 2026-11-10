@@ -231,6 +231,10 @@ func Debug(format string, args ...interface{}) { log(LevelDebug, format, args...
 func Info(format string, args ...interface{})  { log(LevelInfo, format, args...) }
 func Error(format string, args ...interface{}) { log(LevelError, format, args...) }
 
+// Warn 告警级日志（与 Error 同级输出，语义上区分「需关注但未失败」）。
+// 用于必须醒目、但不构成故障的提示（如 fail-open 放行、指纹漂移告警）。
+func Warn(format string, args ...interface{}) { log(LevelError, "WARN: "+fmt.Sprintf(format, args...)) }
+
 // GetLogs 返回最近 limit 条日志（limit<=0 返回全部）。
 func GetLogs(limit int) []Entry {
 	mu.RLock()

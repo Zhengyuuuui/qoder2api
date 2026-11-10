@@ -10,7 +10,18 @@ import (
 )
 
 // ExchangeJobToken 将 PAT 或 refresh token 转换为 job token
+// （直连客户端；账号 / 区域代理场景请用 ExchangeJobTokenWithClient）。
 func ExchangeJobToken(token, machineId, machineToken, machineType string, jobTokenURL ...string) (map[string]interface{}, error) {
+	return ExchangeJobTokenWithClient(nil, token, machineId, machineToken, machineType, jobTokenURL...)
+}
+
+// ExchangeJobTokenWithClient 同 ExchangeJobToken，但可指定 http.Client。
+//
+// 为什么需要：凭证交换发生在「拿到账号 ID 之前」，此时只能按区域绑定
+// 出口（见 bridge.go regionProxyBinding）——若用默认直连客户端，配了
+// 代理的部署会在这一步把真实数据中心出口暴露给上游，与对话流量形成
+// 双出口。client 为 nil 时退回默认直连客户端（兼容旧调用方）。
+func ExchangeJobTokenWithClient(client *http.Client, token, machineId, machineToken, machineType string, jobTokenURL ...string) (map[string]interface{}, error) {
 	date := CurrentDate()
 	sig := SignLegacy(date)
 
@@ -65,7 +76,9 @@ func ExchangeJobToken(token, machineId, machineToken, machineType string, jobTok
 	req.Header.Set("cosy-machineid", machineId)
 	req.Header.Set("user-agent", "Go-http-client/2.0")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

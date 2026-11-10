@@ -70,7 +70,42 @@ func BuildQoderMessages(templateMsgs []interface{}, incoming []interface{}, prom
 	if len(rebuilt) == 0 && prompt != "" {
 		rebuilt = append(rebuilt, BuildUserMessage(prompt))
 	}
+	// 工具结果体积整形：超长工具结果是单请求体积的最大放大器（多轮对话
+	// 每轮都要重发整个上下文），本地按「单条上限 + 总和上限（旧的先截）」
+	// 提前收窄，避免上游因体积断连并连锁触发熔断。
+	truncateToolResults(rebuilt)
 	return rebuilt
+}
+
+// truncateToolResults 就地截断消息列表里 role=tool 的 content 字符串。
+// 预算策略见 ApplyToolResultBudgets：总和超限时旧的先截（最新工具结果
+// 对当前轮次信息价值最高）。scope=off 时原样返回。
+func truncateToolResults(msgs []interface{}) {
+	idx := make([]int, 0, len(msgs))
+	texts := make([]string, 0, len(msgs))
+	for i, m := range msgs {
+		mm, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if role, _ := mm["role"].(string); role != "tool" {
+			continue
+		}
+		s, ok := mm["content"].(string)
+		if !ok || s == "" {
+			continue
+		}
+		idx = append(idx, i)
+		texts = append(texts, s)
+	}
+	if len(texts) == 0 {
+		return
+	}
+	for j, t := range ApplyToolResultBudgets(texts) {
+		if mm, ok := msgs[idx[j]].(map[string]interface{}); ok {
+			mm["content"] = t
+		}
+	}
 }
 
 func ConvertIncomingMessage(msg map[string]interface{}, toolsEnabled bool) map[string]interface{} {

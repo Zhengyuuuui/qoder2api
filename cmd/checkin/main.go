@@ -20,7 +20,7 @@ func main() {
 	} else {
 		// 调试工具保持可运行（不改变退出行为），仅向 stderr 告警降级后果
 		fmt.Fprintln(os.Stderr, "[checkin] init machine salt failed:", err,
-			"；运行于无盐模式（hub 兼容指纹），下次启动恢复加盐将导致全部账号指纹漂移")
+			"；运行于无盐模式（基准形态指纹），下次启动恢复加盐将导致全部账号指纹漂移")
 	}
 
 	accounts, _ := account.List()

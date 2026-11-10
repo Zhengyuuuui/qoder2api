@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -102,15 +103,39 @@ func BuildPayloadB64(info string) (string, error) {
 		"requestId":   NewUUID(),
 		"version":     "v1",
 	}
-	data, err := json.Marshal(m)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(data), nil
+	// 按键典序稳定序列化：该 payload 参与 MD5 签名，签名字节必须逐位
+	// 稳定，不能依赖序列化器的隐式行为（如 map 迭代顺序、空白差异）。
+	return base64.StdEncoding.EncodeToString([]byte(marshalSortedStringMap(m))), nil
 }
 
 func ComposeBearer(payloadB64, sig string) string {
 	return "Bearer COSY." + payloadB64 + "." + sig
+}
+
+// marshalSortedStringMap 按键典序、无多余空白地序列化 string map。
+// 用于签名/加密 payload：字节级稳定是签名可验证的前提，显式排序不依赖
+// map 迭代顺序或任何序列化实现的隐式行为。字符串值逐个经 json.Marshal
+// 转义，保证输出是合法 JSON。
+func marshalSortedStringMap(m map[string]string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		kb, _ := json.Marshal(k)
+		vb, _ := json.Marshal(m[k])
+		sb.Write(kb)
+		sb.WriteByte(':')
+		sb.Write(vb)
+	}
+	sb.WriteByte('}')
+	return sb.String()
 }
 
 func authPayloadJSON(id AuthIdentity) ([]byte, error) {
@@ -125,7 +150,8 @@ func authPayloadJSON(id AuthIdentity) ([]byte, error) {
 		"security_oauth_token": id.SecurityOauthToken,
 		"refresh_token":        id.RefreshToken,
 	}
-	return json.Marshal(m)
+	// 同 BuildPayloadB64：authPayload 参与 AES 加密与签名，字节必须稳定
+	return []byte(marshalSortedStringMap(m)), nil
 }
 
 func rsaEncrypt(plaintext []byte) ([]byte, error) {
@@ -171,10 +197,13 @@ func NewUUID() string {
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// NewRequestID 生成 32 位随机 hex 请求 ID（16 字节完整 hex，与官方客户端
+// 的 requestId 形态一致）。纯随机、不掺账号 uid——掺 uid 的固定前缀是
+// 每个请求都会重复出现的稳定特征，最容易被聚类识别为自动化流量。
 func NewRequestID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
-	return fmt.Sprintf("%x", b)[:24]
+	return fmt.Sprintf("%x", b)
 }
 
 func NewBase64Token() string {
