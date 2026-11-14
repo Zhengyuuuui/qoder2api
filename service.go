@@ -28,6 +28,9 @@ type QoderModel struct {
 	PriceFactor     float64 `json:"price_factor,omitempty"`
 	// ContextTiers 上游 context_config 的全部档位（如 200K/400K/1M）。
 	ContextTiers []bridge.ContextTier `json:"context_tiers,omitempty"`
+	// Region 该清单所属区域（cn / global）。同一实例上两区模型表不同，
+	// 控制台据此标明清单来源，避免用户把别区清单当本区用。
+	Region string `json:"region,omitempty"`
 }
 
 type Service struct {
@@ -583,6 +586,9 @@ func (s *Service) ListQoderModels() ([]QoderModel, error) {
 			ContextWindow:   m.ContextWindow,
 			MaxOutputTokens: m.MaxOutputTokens,
 			ContextTiers:    m.ContextTiers,
+			// 该清单来自哪个区域——同一实例上 CN(8963) 与 Global(8964)
+			// 的模型表不同，控制台必须标明，否则用户会把别区清单当本区用。
+			Region: string(b.Region()),
 		}
 	}
 	return out, nil

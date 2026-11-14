@@ -272,6 +272,97 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 
 ## 更新记录
 
+### 🔄 上游模型清单更新 + 全新模型接入（2026-11-13 / 11-14）
+
+**2026-11-13 CST**（CN 实拉） · **2026-11-14 CST**（Global 实拉）·
+模型列表运行时动态拉取（`/algo/api/v2/model/list`），无需改代码；以下为变更留档。
+
+> ✅ **CN 与 Global 均已实拉验证**（CN 12 个 / Global 13 个）。
+> Global 数据来自账号 `yusheng zheng`（2026-11-14 重新授权后）。
+
+| 变化 | 详情 |
+|------|------|
+| 🆕 **`qmodel_latest` = Qwen4-Max-Preview**（最新一代 Qwen Max） | 全新增度模型。倍率 **0.1**（原值 0.5）、支持推理、200K 默认档（可切 400K / 1M）、32,768 最大输出。**CN 与 Global 均有** |
+| 🆕 **`jmodel` = Step-5-Preview**（最新一代 Step） | 全新增度模型（StepFun / 阶跃星辰）。倍率 **0.3**、支持推理、200K 默认档（可切 400K / 1M）、32,768 最大输出。**CN 与 Global 均有** |
+| 💰 **`qfmodel` / `dfmodel` 倍率 0 → 0.1** | 两区均限免结束，Qwen3.8-Flash / DeepSeek-Flash 恢复计费 |
+| 💰 **CN `qmodel_38max` 倍率 0.2 → 0.5** | 涨价（非错峰时段；错峰 10PM-8AM 按 0.4 折，即 0.2） |
+| 📈 **Global `mmodel` 最大输出 16,384 → 32,768** | 且推理标记由 ❌ 变 ✅ |
+| ➖ **Global `smodel`(Sonus) / `cmodel`(Cantus) / `fast` 消失** | **不是上游下线**——是重新授权时账号的真实设备指纹被覆盖丢失，退回旧协议所致。已修 bug，详见下方 |
+
+#### 两个新模型的实测状态：可用，但当前上游拥堵
+
+| 模型 | 清单 | 推理请求 | 结论 |
+|------|:----:|---------|------|
+| `qmodel_latest` (Qwen4-Max-Preview) | ✅ 两区都有 | 上游**确实受理**并返回 10605 `isQueued`（"前方约 1 人"） | **模型可用**，只是排队 |
+| `jmodel` (Step-5-Preview) | ✅ 两区都有 | 同上；另一次成功返回（排队 32s 后出首字） | **模型可用**，只是排队 |
+
+> ⚠️ **别被"排队超时"误判成"模型不可用"**：这两个新模型当前时段上游很拥堵——
+> 实测一次流式请求重试到 **第 10 次、累计等待 4m30s** 仍在排队。
+> 证据在 `/api/queue/log`（`outcome: cancelled` 表示**客户端先断开**，
+> 而非模型失败）：
+>
+> ```json
+> {"model":"qmodel_latest","account":"nick6931363169","region":"cn","tries":3,"total_wait_sec":90,"outcome":"cancelled"}
+> {"model":"jmodel","account":"yusheng zheng","region":"global","tries":3,"total_wait_sec":90,"outcome":"cancelled"}
+> ```
+>
+> **建议**：错峰使用；或在控制台调大 `queue_wait_cap_sec`（单次排队等待上限），
+> 让网关多等一会儿。CN 侧另有 `qmodel_38max` / `gmodel` / `qfmodel` 等稳定档位可作退路。
+
+#### 关于 key 命名：`qmodel_latest` 就是 Qwen4-Max
+
+上游的 key 命名不直观，容易找错模型：
+
+| 显示名 | key | 倍率 | 说明 |
+|--------|-----|------|------|
+| **Qwen4-Max-Preview** | **`qmodel_latest`** | 0.1 | 最新一代 Qwen Max（`_latest` 后缀 = 最新代） |
+| Qwen3.8-Max | `qmodel_38max` | 0.5 | 上一代 |
+
+> 💡 按 `qmodel` 关键字搜会同时命中两者（`qmodel_38max` 与 `qmodel_latest`），
+> 注意区分。**调用一律用 key，不用显示名**——显示名会随上游改版变化。
+
+**附带修复**：
+
+| 文件 | 内容 |
+|------|------|
+| `account/oauth.go` | **重新授权时保留账号已有的 `checkin_fingerprint` / `device_identity`**——此前会整体覆盖账号文件，导致指纹丢失、模型清单退化（详见下方 bug 说明） |
+| `internal/bridge/bridge.go` | `ListAvailableModels` 改为**逐账号故障转移**——此前只取池内第一个账号，它凭证失效（403 `Signature invalid`）会让整个 `/v1/models` 退化成硬编码兜底清单；现在会换下一个账号重试；并**限定在本桥区域内换号**（不跨区拉别区清单） |
+| `internal/bridge/claude.go` | 兜底清单刷新为当前 CN 快照（12 个），移除已下线的 `qmodel` / `q37fmodel` / `gm51model`，补入 `qmodel_latest` / `jmodel` |
+| `webconsole/index.html` | NewAPI 配置的 models 数组**改为动态取自上游实时清单**（拉不到才回退 CN 快照）——原先写死，上游改版后客户端会拿着已下线的 key 去请求 |
+| `service.go` / `webconsole/index.html` | 模型面板标注**清单来源区域**（CN 8963 / Global 8964 模型表不同，避免混用） |
+| `cmd/modellist/`（新增） | 实时拉取上游清单的只读工具，供日后上游改版时对照更新 |
+| `internal/bridge/modellist_failover_test.go`（新增） | 回归测试：换号 / 全部失败 / 不跨区 |
+
+#### 🐛 重新授权抹掉账号真实设备指纹 → Sonus/Cantus/Fast 消失
+
+**现象**：Global 账号重新 OAuth 授权后，原本能用的 **Sonus(`smodel`) /
+Cantus(`cmodel`) / Fast(`fast`)** 三个模型从 `model/list` 里消失，
+账号文件里的 `checkin_fingerprint` 变成 `null`。
+
+**根因**：`account.buildAccountFromToken` 构造的是一个**全新的 `Account` 对象**
+（`checkin_fingerprint` / `device_identity` 字段全空），随后 `main.handleOAuthWait`
+直接 `account.Save(acct)` **整体覆盖**旧账号文件——旧账号的指纹随之消失。
+账号退回旧协议（`clienttype=5` / `version=1.0.10`），上游便不再下发这三个模型。
+
+**修复**：重新授权时**保留同一账号已有的 `checkin_fingerprint` / `device_identity`**。
+同一账号重新授权 = 同一台设备，不该被上游当成「换设备」；抹掉指纹反而制造了这个风险。
+
+> ⚠️ 修复只能防止**今后**再丢。已经丢失的指纹需从官方客户端重新抓包
+> （`scripts/capture/` 工具链），或用该账号自己的真实指纹重新登录。
+
+#### 📋 本轮账号凭证体检（`GET /api/v1/userinfo`）
+
+| 账号 | 区域 | device_token | 状态 |
+|------|------|:------------:|------|
+| `nick6931363169` | cn | ✅ 有效 | 可用，CN 清单 12 个 |
+| `nick8034851628` | cn | ❌ `TOKEN_EXPIRE` | 需重新授权 |
+| `yusheng zheng` | global | ✅ 有效（2026-11-14 重新授权） | 可用，Global 清单 13 个 |
+| `tmpreg gep` | global | ❌ `TOKEN_EXPIRE` | 需重新授权（**它仍持有完整的真实设备指纹**，重新授权后即可恢复 15 个模型） |
+
+> 💡 **运维提醒**：`auto_refresh_token` 在 `~/.qoder2api-cn/settings.json` 里是**关闭**的，
+> 而实际 token 有效期明显短于「15 天自动续期」的窗口设定——建议在控制台开启自动续期，
+> 避免再次出现「全部账号 TOKEN_EXPIRE」。
+
 ### 🔐 安全加固：代理非法即拒、指纹可回退、封控默认开（2026-11-10）
 
 **2026-11-10 CST**
@@ -503,60 +594,119 @@ App 端能选到的大 context 在 bridge 侧完全丢失。
 
 ![qoder2api 控制台账号额度列表](docs/img/console-account-packages.jpg)
 
-### 📋 模型总表（2026-10-26 实拉）
+### 📋 模型总表
+
+| 区域 | 状态 | 数据来源 |
+|------|:----:|---------|
+| 🇨🇳 国内版（CN · 8963） | ✅ **2026-11-13 实拉验证** | 本轮实时拉取，12 个 |
+| 🌐 国际版（Global · 8964） | ✅ **2026-11-14 实拉验证** | 本轮实时拉取，13 个（`yusheng zheng`） |
 
 模型清单由上游 `GET /algo/api/v2/model/list` 在运行时动态拉取，下方为当时快照，仅供对照；
 实际以 `/v1/models` 返回为准。`price_factor` 为相对倍率，`0` 表示限免。
 
 > ⚠️ 同一 key 在**两区的推理支持与最大输出可能不同**（上游按区配置），故分表列出。
-> 国际版下表为**新版推理协议账号**（配置真实指纹）快照；旧协议账号仍为较少的模型清单。
+> 国际版下表为**旧协议账号**（`clienttype=5` / `version=1.0.10`）快照——配置真实
+> 指纹的新版协议账号会**额外多出** `smodel`(Sonus) / `cmodel`(Cantus) / `fast` 三个。
 
-#### 国内版 · 10 个（Bridge `8963`）
+> 💡 **想自己拉一份最新的**：`go run ./cmd/modellist`（用本机账号凭证实时拉取并打印
+> 结构化清单，含 context 档位 / 倍率 / 推理标记）。上游改版后更新下表时用它对照。
 
-| Key | 显示名 | 上下文 | 最大输出 | 倍率 | 推理 |
-|-----|--------|--------|----------|------|:----:|
+#### 国内版 · 12 个（Bridge `8963`）· ✅ 2026-11-13 实拉
+
+> 「上下文」列 = **默认档**（`context_config` 里 `is_default` 的那档，通常 200K）。
+> 所有模型另外还提供 **400K / 1M** 两档，可在控制台「Context 档位」里切换。
+
+| Key | 显示名 | 上下文（默认档） | 最大输出 | 倍率 | 推理 |
+|-----|--------|------------------|----------|------|:----:|
 | `auto` | Auto | 200,000 | 32,768 | 0.5 | ✅ |
+| `qmodel_latest` | **Qwen4-Max-Preview** 🆕 最新一代 Qwen Max | 200,000 | 32,768 | 0.1 | ✅ |
 | `qmodel_38max` | Qwen3.8-Max | 200,000 | 32,768 | 0.5 | ✅ |
-| `qfmodel` | Qwen3.8-Flash | 200,000 | 32,768 | **0** 🆓 | ✅ |
+| `qfmodel` | Qwen3.8-Flash | 200,000 | 32,768 | 0.1 | ✅ |
 | `dmodel` | DeepSeek-V4-Pro | 200,000 | 32,768 | 0.5 | ✅ |
-| `dfmodel` | DeepSeek-Flash | 200,000 | 16,384 | **0** 🆓 | — |
+| `dfmodel` | DeepSeek-Flash | 200,000 | 16,384 | 0.1 | — |
 | `gmodel` | GLM-5.3 | 200,000 | 32,768 | 0.8 | ✅ |
 | `gfmodel` | GLM-5.3-Flash | 200,000 | 32,768 | 0.1 | ✅ |
-| `kmodel_latest` | **Kimi-K3.1-Pro** | 200,000 | 16,384 | 1 | — |
+| `jmodel` | **Step-5-Preview** 🆕 最新一代 Step | 200,000 | 32,768 | 0.3 | ✅ |
+| `kmodel_latest` | Kimi-K3.1-Pro | 200,000 | 16,384 | 1 | — |
 | `kmodel` | Kimi-K2.8-Preview | 200,000 | 32,768 | 0.8 | ✅ |
-| `mmodel` | MiniMax-M3.1-Flash | 200,000 | 16,384 | 0.1 | — |
+| `mmodel` | MiniMax-M3.1-Flash | 200,000 | 32,768 | 0.1 | ✅ |
 
-#### 国际版 · 15 个（Bridge `8964` · 新版推理协议账号）
+> ⚠️ **两个最新模型（`qmodel_latest` / `jmodel`）当前上游拥堵**：请求会被受理但长时间
+> 排队（10605 `isQueued`）。**这是容量问题，不是模型不可用**——建议错峰使用，
+> 或调大控制台的 `queue_wait_cap_sec`。
 
-| Key | 显示名 | 上下文 | 最大输出 | 倍率 | 推理 |
-|-----|--------|--------|----------|------|:----:|
+#### 国际版 · 13 个（Bridge `8964`）· ✅ 2026-11-14 实拉
+
+> ✅ **2026-11-14 实拉验证**（账号 `yusheng zheng`，旧协议 `clienttype=5` / `version=1.0.10`）。
+> 实际以 `/v1/models` 返回为准。
+>
+> 「上下文」列 = **默认档**；除 `efficient` 仅 200K 外，其余模型另有 **400K / 1M** 两档可选。
+
+| Key | 显示名 | 上下文（默认档） | 最大输出 | 倍率 | 推理 |
+|-----|--------|------------------|----------|------|:----:|
 | `auto` | Auto | 200,000 | 16,384 | 0.5 | — |
 | `ultimate` | Ultimate | 200,000 | 32,768 | 2 | ✅ |
 | `efficient` | Efficient | 200,000 | 16,384 | 0.3 | — |
 | `qmodel_38max` | Qwen3.8-Max | 200,000 | 32,768 | 0.5 | ✅ |
-| `qfmodel` | Qwen3.8-Flash | 200,000 | 32,768 | **0** 🆓 | ✅ |
+| `qfmodel` | Qwen3.8-Flash | 200,000 | 32,768 | 0.1 | ✅ |
 | `dmodel` | DeepSeek-V4-Pro | 200,000 | 32,768 | 0.5 | ✅ |
-| `dfmodel` | DeepSeek-Flash | 200,000 | 32,768 | **0** 🆓 | ✅ |
+| `dfmodel` | DeepSeek-Flash | 200,000 | 32,768 | 0.1 | ✅ |
 | `gmodel` | GLM-5.3 | 200,000 | 32,768 | 0.8 | ✅ |
 | `gfmodel` | GLM-5.3-Flash | 200,000 | 32,768 | 0.1 | ✅ |
-| `kmodel_latest` | **Kimi-K3.1-Pro** | 200,000 | 16,384 | 1 | — |
+| `qmodel_latest` | **Qwen4-Max-Preview** 🆕 最新一代 Qwen Max | 200,000 | 32,768 | 0.1 | ✅ |
+| `jmodel` | **Step-5-Preview** 🆕 最新一代 Step | 200,000 | 32,768 | 0.3 | ✅ |
+| `kmodel_latest` | Kimi-K3.1-Pro | 200,000 | 16,384 | 1 | — |
 | `kmodel` | Kimi-K2.8-Preview | 200,000 | 16,384 | 0.8 | — |
-| `mmodel` | MiniMax-M3.1-Flash | 200,000 | 16,384 | 0.1 | — |
-| `smodel` | **Sonus** 🆕 | 200,000 | 32,768 | **8** | ✅ |
-| `cmodel` | **Cantus** 🆕 | 200,000 | 32,768 | **4** | ✅ |
-| `fast` | **Fast** 🆕 | 200,000 | 16,384 | 0.8 | — |
+| `mmodel` | MiniMax-M3.1-Flash | 200,000 | 32,768 | 0.1 | ✅ |
 
-> 🆕 = 2026-10-23 新增（Sonus / Cantus / Fast）；**Kimi-K3.1-Pro** 为 2026-10-26 由 Kimi-K3 升级而来（key 未变、倍率 1.4→1）。倍率为该快照账号实测，可能随账号档位/活动浮动。
+> ⚠️ **两个最新模型（`qmodel_latest` / `jmodel`）当前上游拥堵**：请求会被受理但长时间
+> 排队（10605 `isQueued`）。**这是容量问题，不是模型不可用**——建议错峰使用，
+> 或调大控制台的 `queue_wait_cap_sec`。
+
+> 🆕 = 2026-11-13/14 新增（Qwen4-Max-Preview / Step-5-Preview）。
+> **Kimi-K3.1-Pro** 为 2026-10-26 由 Kimi-K3 升级而来（key 未变、倍率 1.4→1）。
+> 倍率为该快照账号实测，可能随账号档位/活动浮动。
+
+**⚠️ 相对 2026-10-26 快照的变化**
+
+| 变化 | 详情 |
+|------|------|
+| 🆕 **新增 `qmodel_latest`** | Qwen4-Max-Preview，两区均有 |
+| 🆕 **新增 `jmodel`** | Step-5-Preview，两区均有 |
+| ➖ **`smodel`(Sonus) / `cmodel`(Cantus) / `fast` 消失** | **不是上游下线**，而是该账号的 `checkin_fingerprint` 在重新授权时被覆盖丢失，退回旧协议（5 / 1.0.10）导致这三个不再下发。见下方说明 |
+| 💰 `qfmodel` / `dfmodel` 倍率 0 → 0.1 | 限免结束 |
+| 📈 `mmodel` 最大输出 16,384 → 32,768 | 且推理标记 由 ❌ 变 ✅ |
 
 **区域差异速览**
 
 | 差异 | 详情 |
 |------|------|
 | 国际独占 | `ultimate` / `efficient`；新版协议账号额外独占 `smodel`(Sonus) / `cmodel`(Cantus) / `fast` |
-| 推理标记不同 | `auto` / `kmodel` 国内支持、国际不支持；`dfmodel` 反之 |
-| 最大输出不同 | 多数模型国内 32,768、国际 16,384；`dfmodel` 相反 |
+| 推理标记不同 | `auto` / `kmodel` 国内 ✅、国际 ❌；`dfmodel` 反之（国内 ❌、国际 ✅） |
+| 最大输出不同 | `auto` / `kmodel` / `kmodel_latest` / `efficient` 国内 32,768、国际 16,384；`dfmodel` 相反（国内 16,384、国际 32,768）；`mmodel` 两区均 32,768（Global 于 2026-11-14 由 16,384 上调） |
+| 上下文 | 两区**完全一致**：除 `efficient` 仅 200K 外，其余模型均提供 200K / 400K / 1M 三档（默认档 200K） |
 
-> 🆓 = 限免（倍率 0）；🆕 = 本轮（2026-10-23）新增。倍率可能随账号档位/活动浮动。
+> 🆓 = 限免（倍率 0）；倍率随账号档位/活动浮动。
+> ⚠️ CN 的 `qmodel_38max` / `qfmodel` 带**错峰折扣**（10PM-8AM 4 折，`promotion.discount_factor=0.4`），
+> 非错峰时段按原价计费。
+
+#### 🐛 修复：重新授权会抹掉账号的真实设备指纹（2026-11-14）
+
+**现象**：账号重新 OAuth 授权后，原本能用的 **Sonus(`smodel`) / Cantus(`cmodel`) /
+Fast(`fast`)** 三个模型从 `model/list` 里消失，且账号文件里的
+`checkin_fingerprint` 变成 `null`。
+
+**根因**：`account.buildAccountFromToken` 构造的是一个**全新的 `Account` 对象**
+（`checkin_fingerprint` / `device_identity` 字段全空），随后 `main.handleOAuthWait`
+直接 `account.Save(acct)` **整体覆盖**旧账号文件——旧账号的指纹随之消失。
+账号退回旧协议（`clienttype=5` / `version=1.0.10`），上游便不再下发这三个模型。
+
+**修复**：重新授权时**保留同一账号已有的 `checkin_fingerprint` / `device_identity`**。
+同一账号重新授权 = 同一台设备，不该被上游当成「换设备」；抹掉指纹反而制造了这个风险。
+（见 `account/oauth.go` `buildAccountFromToken`）
+
+> ⚠️ 修复只能防止**今后**再丢。已经丢失的指纹需从官方客户端重新抓包
+> （`scripts/capture/` 工具链），或用另一账号的真实指纹重新登录该账号。
 
 #### ✅ SOTA「Sonus」模型已可通过新版推理协议访问（2026-10-23 更正）
 
@@ -1104,6 +1254,7 @@ qoder2api/
 ├── checkin.go           # 每日签到（手动 API + 10:00 自动调度 + 连续天数统计 + CN/Global 双区域）
 ├── account/             # 账号、OAuth、设置、密钥文件存储
 ├── cmd/checkin/         # 签到/额度只读调试工具
+├── cmd/modellist/       # 模型清单只读调试工具（实时拉取上游 model/list）
 ├── internal/
 │   ├── bridge/          # OpenAI / Claude / Codex 兼容层 + 错误分类
 │   └── cosy/            # Qoder 签名、会话与设备指纹

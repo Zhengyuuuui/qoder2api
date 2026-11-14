@@ -223,6 +223,8 @@ func buildAccountFromToken(deviceToken, refreshToken string, region Region, ep E
 		Tags:      []string{},
 		CreatedAt: now,
 	}
+	// 重新授权时保留同一账号已有的设备身份。
+	preserveDeviceIdentity(acct, id)
 	secretPayload, err := json.Marshal(map[string]string{
 		"device_token":  deviceToken,
 		"refresh_token": refreshToken,
@@ -234,6 +236,29 @@ func buildAccountFromToken(deviceToken, refreshToken string, region Region, ep E
 		return nil, err
 	}
 	return acct, nil
+}
+
+// preserveDeviceIdentity 把同一账号已有的设备身份复制到新构造的账号上。
+//
+// 为什么必须保留：checkin_fingerprint 是「官方客户端抓包的真实设备指纹」，
+// 它决定上游按 (clienttype, version) 下发哪些模型——旧协议
+// （5 / 1.0.10）拿不到 Sonus/Cantus/Fast，重新授权时若把它抹掉，
+// 账号会静默退化成旧协议清单（实测 2026-11-14：重新授权后
+// smodel/cmodel/fast 三个模型从清单里消失）。
+//
+// 同一账号重新授权 = 同一台设备，不该被上游当成「换设备」；
+// 抹掉指纹反而制造了这个风险。device_identity 同理（推理侧与
+// 签到侧必须共用同一份身份）。
+//
+// 账号不存在（首次登录）时什么都不做——此时新账号本来就没有指纹。
+func preserveDeviceIdentity(acct *Account, id string) {
+	prev, err := Get(id)
+	if err != nil || prev == nil {
+		return
+	}
+	acct.CheckinFingerprint = prev.CheckinFingerprint
+	acct.DeviceIdentity = prev.DeviceIdentity
+	acct.CreatedAt = prev.CreatedAt
 }
 
 // fetchUserInfo 拉取 userinfo（账号 ID 之前的阶段，按区域代理出口）。

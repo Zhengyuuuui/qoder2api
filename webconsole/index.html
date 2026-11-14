@@ -310,6 +310,7 @@
           <span class="msg" id="ctxTierMsg"></span>
         </div>
         <div id="modelsBox">加载中...</div>
+        <div class="muted" id="modelsRegionHint" style="margin-top:6px; font-size:12px"></div>
       </div>
       <div>
         <h3>最近日志</h3>
@@ -530,12 +531,35 @@
       if (document.activeElement !== $('breakerDegradeToggle')) {
         $('breakerDegradeToggle').checked = settings.breaker_degrade !== false;
       }
+      renderNewAPIConfig(openai, key);
+    }
+
+    // NewAPI 配置里的 models 数组：**优先用上游实时清单**（/api/models），
+    // 拉不到时回退到硬编码快照。
+    //
+    // 为什么不用硬编码：上游清单会变（新模型 / 下线 / 改显示名），
+    // 写死的数组一旦过期，客户端就会拿着已下线的 key 去请求，
+    // 报「模型不存在」——而用户看到的配置却完全正常。
+    //
+    // 为什么保留兜底：上游拉不到时（账号凭证失效 / 网络不通），
+    // 仍要给出一份可用配置，否则用户连配置都复制不出来。
+    //
+    // 兜底只列**国内版**已验证的 key：本面板生成的 base_url 指向主桥
+    // （CN 8963），把国际版独占的 key 塞进来会让客户端必然撞「模型不存在」。
+    const FALLBACK_MODEL_KEYS = [
+      'auto', 'qmodel_latest', 'qmodel_38max', 'qfmodel', 'dmodel', 'dfmodel',
+      'gmodel', 'gfmodel', 'jmodel', 'kmodel_latest', 'kmodel', 'mmodel',
+    ];
+
+    let liveModelKeys = null;
+
+    function renderNewAPIConfig(openai, key) {
       const cfg = {
         name: 'QCCG / Qoder',
         type: 'openai',
         base_url: openai,
         api_key: key,
-        models: ['auto', 'ultimate', 'efficient', 'qmodel_38max', 'qfmodel', 'dmodel', 'dfmodel', 'gmodel', 'gfmodel', 'kmodel_latest', 'kmodel', 'mmodel', 'smodel', 'cmodel', 'fast'],
+        models: (liveModelKeys && liveModelKeys.length) ? liveModelKeys : FALLBACK_MODEL_KEYS,
       };
       $('newapiBox').textContent = JSON.stringify(cfg, null, 2);
     }
@@ -1067,6 +1091,20 @@
         $('modelsBox').innerHTML = renderModelsTable(models);
         renderCtxTierOptions(models);
         loadCtxTier(models);
+        // 标明清单来自哪个区域（CN 8963 / Global 8964 的模型表不同）
+        const regions = [...new Set((models || []).map(m => m.region).filter(Boolean))];
+        const hint = $('modelsRegionHint');
+        if (hint) {
+          hint.textContent = regions.length
+            ? `清单来源区域：${regions.map(r => (r === 'cn' ? '国内版 CN (8963)' : r === 'global' ? '国际版 Global (8964)' : r)).join(', ')} · 共 ${models.length} 个`
+            : `共 ${models.length} 个（未能确认来源区域）`;
+        }
+        // 用实时清单刷新 NewAPI 配置里的 models 数组（上游改版后自动跟上）
+        const keys = (models || []).map(m => m.key || m.id).filter(Boolean);
+        if (keys.length) {
+          liveModelKeys = keys;
+          renderNewAPIConfig($('openaiBaseUrl').value || '', $('bridgeTokenInput').value || 'qccg');
+        }
       } catch (e) {
         $('modelsBox').textContent = e.message;
       }

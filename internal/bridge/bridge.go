@@ -115,6 +115,8 @@ type Bridge struct {
 	pool *Pool
 	// chatStreamURL 测试注入用：非空时覆盖 region 对应的上游 chat 流地址
 	chatStreamURL string
+	// modelListURL 测试注入用：非空时覆盖 region 对应的上游模型目录地址
+	modelListURL string
 
 	// 模型目录缓存（context 档位解析用）
 	catalogCacheMu sync.Mutex
@@ -247,14 +249,66 @@ func NewBridgeWithFP(pat string, region account.Region, templateBase map[string]
 	}, nil
 }
 
+// Region 返回本桥所属区域（池模式下即该桥负责的区域）。
+func (b *Bridge) Region() account.Region { return b.region }
+
 // ListAvailableModels 通过 cosy 签名调用 /algo/api/v2/model/list 拉取上游模型清单。
 // 返回顶层 assistant 数组中 enable=true 的模型，按 is_default desc + display_name asc 排序。
+//
+// 逐个账号尝试：与对话路径一样，某个账号的凭证失效（403 Signature invalid /
+// TOKEN_EXPIRE）不应让整个模型清单拿不到——池里换一个可用账号即可。
 func (b *Bridge) ListAvailableModels() ([]QoderModel, error) {
-	slot, ok := b.pickSlot(nil)
-	if !ok {
-		return nil, ErrNoAccount
+	tried := make(map[string]struct{})
+	var lastErr error
+	for {
+		// 只在本桥所属区域内换号：跨区会把请求派给别区账号，
+		// 清单也会变成别区的模型表（与对话路径同一条约束）。
+		slot, ok := b.pickSlotInRegion(tried)
+		if !ok {
+			break
+		}
+		models, err := b.listModelsFromSlot(slot)
+		if err == nil {
+			return models, nil
+		}
+		lastErr = err
+		// 凭证类失败换号重试；其他失败（端点 5xx 等）也换号——
+		// 目录拉取是只读查询，多试几个账号代价极低。
+		logger.Info("ListAvailableModels: account=%s id=%s region=%s failed: %v",
+			slot.Name, slot.ID, slot.Region, err)
+		tried[slot.ID] = struct{}{}
 	}
-	modelListURLs := qoderModelListCandidates(slot.Region)
+	if lastErr == nil {
+		lastErr = ErrNoAccount
+	}
+	return nil, lastErr
+}
+
+// pickSlotInRegion 在本桥区域内选号（池模式按 region 过滤，单账号模式直接返回）。
+//
+// 区域口径与对话路径（pickSlotForModel）一致：Bridge.region 为空时回退到
+// 池内首个 slot 的区域，而不是放行全部账号——跨区会拉错区的模型清单。
+func (b *Bridge) pickSlotInRegion(exclude map[string]struct{}) (*Slot, bool) {
+	if b.pool == nil {
+		return b.pickSlot(exclude)
+	}
+	wantRegion := b.region
+	if wantRegion == "" {
+		b.pool.mu.Lock()
+		for _, s := range b.pool.slots {
+			wantRegion = s.Region
+			break
+		}
+		b.pool.mu.Unlock()
+	}
+	return b.pool.PickForModel(exclude, "", func(s *Slot) bool {
+		return wantRegion == "" || s.Region == wantRegion
+	})
+}
+
+// listModelsFromSlot 用指定账号拉取模型清单。
+func (b *Bridge) listModelsFromSlot(slot *Slot) ([]QoderModel, error) {
+	modelListURLs := b.modelListURLs(slot.Region)
 	if len(modelListURLs) == 0 {
 		return nil, fmt.Errorf("no model list endpoint for region %s", slot.Region)
 	}
@@ -273,6 +327,14 @@ func (b *Bridge) ListAvailableModels() ([]QoderModel, error) {
 		return nil, fmt.Errorf("%s -> empty model list, keys=%v", modelListURLs[0], keys)
 	}
 	return models, nil
+}
+
+// modelListURLs 返回该区域的模型目录端点候选（测试注入时覆盖）。
+func (b *Bridge) modelListURLs(region account.Region) []string {
+	if b.modelListURL != "" {
+		return []string{b.modelListURL}
+	}
+	return qoderModelListCandidates(region)
 }
 
 func parseQoderModels(resp map[string]interface{}) []QoderModel {
@@ -966,8 +1028,13 @@ func InferAgent(model string) string {
 //
 // 设计原则：默认表只负责让请求落到合法 SKU 不出错，差异化由用户在 UI 自行覆盖。
 // Qoder 上游合法 key 见 /v1/models 返回，随上游变化动态调整。
-// GPT / Gemini 没有专属 SKU，统一映射到主力档 performance —— 既不浪费 ultimate 高 price_factor，
-// 也不被 lite 限频；想分档（如 gpt-5→ultimate / gpt-5-mini→efficient）请在 UI 配置。
+// GPT / Gemini 没有专属 SKU，分别落到 dmodel（DeepSeek-V4-Pro）/ gmodel（GLM-5.3）——
+// 既不浪费 ultimate 的高 price_factor，也不被 lite 限频；
+// 想分档（如 gpt-5→ultimate / gpt-5-mini→efficient）请在 UI 配置。
+//
+// 注意：此表只认 **key**（如 "jmodel" / "qmodel_latest"），不认上游显示名
+// （如 "Step-5-Preview"）——显示名会随上游改版变化，写进表里必然漂移。
+// 客户端直接传显示名时，请在控制台 ModelMappings 里配置成 key。
 var defaultModelMapping = map[string]string{
 	// Claude 三档
 	"opus":   "qmodel_38max",
