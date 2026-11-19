@@ -319,9 +319,63 @@ access token 并回传新的 refresh_token）在过期前**主动续期**。
 | Qwen3.8-Max | `qmodel_38max` | 0.5 | 上一代 |
 
 > 💡 按 `qmodel` 关键字搜会同时命中两者（`qmodel_38max` 与 `qmodel_latest`），
-> 注意区分。**调用一律用 key，不用显示名**——显示名会随上游改版变化。
+> 注意区分。**调用建议一律用 key**——显示名会随上游改版变化（既然 v2026-11-19 起
+> 网关已内置显示名映射，传显示名也能用，但 key 更稳）。
 
-**附带修复**：
+#### 🐛 修复：传「显示名」导致请求成功却不扣额度 + 易撞排队（issue #13）
+
+**现象**（issue #13）：调模型经常排队甚至 429；「即使调用成功，qoder 也不显示有使用额度」。
+cn team / cn pro 账号都这样。
+
+**根因**：`MapModel` 此前只认 Claude / GPT / Gemini **家族关键字**，其余一律
+`ToLower` 后原样发给上游。客户端传界面上看到的**显示名**（如 `Qwen4-Max-Preview`）时，
+上游收到的是 `qwen4-max-preview` —— **一个不存在的 key**。上游对未知 key 会
+**走兜底返回内容、但不把这次调用计入 quota**，于是：
+
+1. 请求"成功"了，dashboard 却没有任何用量（额度没被消耗）；
+2. 这类请求没有真实配额支撑，更容易被限流 → 表现为**排队 / 429**。
+
+实测对照（`MapModel` 输出）：
+
+| 客户端传入 | 修复前发给上游 | 修复后 |
+|---|---|---|
+| `Qwen4-Max-Preview` | `qwen4-max-preview` ❌ 未知 key、不计费 | `qmodel_latest` ✅ |
+| `Step-5-Preview` | `step-5-preview` ❌ | `jmodel` ✅ |
+| `Qwen3.8-Max` | `qwen3.8-max` ❌ | `qmodel_38max` ✅ |
+| `qwen4-max` / `step5` | `qwen4-max` ❌ | `qmodel_latest` / `jmodel` ✅ |
+| `auto` / `kmodel`（合法 key） | 原样 ✅ | 原样 ✅ |
+
+**修复**：
+- 新增 `upstreamDisplayNameAliases` 别名表（显示名 + 常见简写 → key），
+  在 `ToLower` 兜底**之前**查表；附归一化前缀匹配（去 `-`/`_`/空格），
+  歧义时宁可不猜（猜错会消耗别的模型额度）。
+- 新增 `knownUpstreamKeys` + `IsKnownUpstreamKey`：`CallQoder` 发现最终 key
+  不在合法集合时打 **WARN** 并点明后果，作为「不扣额度」的早期信号。
+  **只告警不拦截**——上游随时可能新增 key，硬拒会把新模型挡在门外。
+
+> ⚠️ 注意与 issue #139 区分：#139 是**纯上游容量排队**（官方客户端同时刻也一样），
+> 与额度机制无关；本 issue 的「不扣额度」是 key 映射错误导致的，两者症状
+> 会叠加，但根因不同。
+
+**本轮改动文件**：
+
+| 文件 | 内容 |
+|------|------|
+| `internal/bridge/bridge.go` | `MapModel` 增加显示名别名表 + `IsKnownUpstreamKey`；`CallQoderWithOpts` 对未知 key 打 WARN |
+| `webconsole/index.html` | **修复冷却态表格错位**：操作列 `<td class="row">` 用了 `display:flex`，会让单元格脱离表格列宽分配、整表错位；改为 `.action-cell` + 内层 `.action-wrap`；长错误文案加 `.slot-note`（`word-break` + 宽度上限）；熔断/降权时长改用 `16m14s` / `1h01m` 可读格式；模型冷却列出具体模型与剩余时长；窄屏下按钮纵向堆叠 |
+| `internal/bridge/model_alias_test.go`（新增） | 显示名映射 / 近似名不串号 / 用户配置优先 / 未知 key 识别 |
+
+**同一轮的其它修复**：
+
+| 文件 | 内容 |
+|------|------|
+| `account/oauth.go` | **重新授权时保留账号已有的 `checkin_fingerprint` / `device_identity`**——此前会整体覆盖账号文件，导致指纹丢失、模型清单退化（详见下方 bug 说明） |
+| `internal/bridge/bridge.go` | `ListAvailableModels` 改为**逐账号故障转移**——此前只取池内第一个账号，它凭证失效（403 `Signature invalid`）会让整个 `/v1/models` 退化成硬编码兜底清单；现在会换下一个账号重试；并**限定在本桥区域内换号**（不跨区拉别区清单） |
+| `internal/bridge/claude.go` | 兜底清单刷新为当前 CN 快照（12 个），移除已下线的 `qmodel` / `q37fmodel` / `gm51model`，补入 `qmodel_latest` / `jmodel` |
+| `webconsole/index.html` | NewAPI 配置的 models 数组**改为动态取自上游实时清单**（拉不到才回退 CN 快照）——原先写死，上游改版后客户端会拿着已下线的 key 去请求 |
+| `service.go` / `webconsole/index.html` | 模型面板标注**清单来源区域**（CN 8963 / Global 8964 模型表不同，避免混用） |
+| `cmd/modellist/`（新增） | 实时拉取上游清单的只读工具，供日后上游改版时对照更新 |
+| `internal/bridge/modellist_failover_test.go`（新增） | 回归测试：换号 / 全部失败 / 不跨区 |
 
 | 文件 | 内容 |
 |------|------|

@@ -556,6 +556,17 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	if model != originalModel {
 		logger.Debug("mapModel %s/%s -> %s", agent, originalModel, model)
 	}
+	// 未知 key 是「请求成功但不扣额度」的早期信号（issue #13）：
+	// 上游对不认识的 key 走兜底返回内容、不计 quota，这类请求没有真实
+	// 配额支撑，更容易撞排队 / 429。这里只告警不拦截——上游随时可能
+	// 新增 key，硬拒会把新模型挡在门外。
+	if !IsKnownUpstreamKey(model) {
+		logger.Warn("[model] unknown upstream key %q (client sent %q, agent=%s): "+
+			"upstream will fall back and NOT count quota — this is why a request "+
+			"can succeed yet show no usage. Use a real key from /v1/models, "+
+			"or configure ModelMappings in the console",
+			model, originalModel, agent)
+	}
 
 	// 自适应节流打点：每个客户端请求计一次（成功在下方打点）。信号
 	// （排队/频控）由客户端层 noteRisk 逐次观测打点，与遥测同口径。
@@ -1045,13 +1056,18 @@ var defaultModelMapping = map[string]string{
 	"gemini": "gmodel",
 }
 
-// MapModel 解析顺序（账号维度优先、双向 substring 模糊匹配兜底）：
+// MapModel 解析顺序（账号维度优先、显示名与族关键字兜底）：
 //  1. 用户 Settings.ModelMappings[agent] 精确命中
 //  2. 用户 Settings.ModelMappings[agent] 双向 substring 模糊匹配（按 source 长度倒序，最长优先）
 //  3. 用户旧 Settings.ModelMapping (deprecated 扁平表) 命中
 //  4. defaultModelMapping 精确命中
 //  5. defaultModelMapping 双向 substring 模糊匹配
-//  6. ToLower 兜底（如客户端传 "Performance" 这种 display_name 大小写）
+//  6. 上游显示名别名表（"Qwen4-Max-Preview" → qmodel_latest）
+//  7. ToLower 兜底（客户端直接传 key 的形态，如 "dmodel" / "performance"）
+//
+// 第 6 步是 issue #13 的修复：只认 Claude/GPT/Gemini 关键字时，
+// Qoder 自己的显示名会被 ToLower 后原样发给上游 → 未知 key → 上游兜底
+// 返回内容但不计 quota（"请求成功但 dashboard 无用量"）。
 //
 // agent 取值 "claude" / "codex" / "gemini"，由 handler 入口决定；空串表示未知 agent，跳过 agent 桶。
 //
@@ -1080,13 +1096,134 @@ func MapModel(agent, model string) string {
 		}
 	}
 
-	// 3. 内置默认映射兜底
+	// 3. 内置默认映射兜底（Claude / GPT / Gemini 家族关键字）
 	if mapped := lookupMapping(model, defaultModelMapping); mapped != "" {
 		return mapped
 	}
 
-	// 4. 大小写归一化兜底（客户端可能直接传 Qoder key 如 "Performance"/"dmodel"）
-	return strings.ToLower(model)
+	// 4. 上游显示名 → key（"Qwen4-Max-Preview" → qmodel_latest）。
+	// 必须在 ToLower 之前：否则显示名会被原样小写发给上游，落到兜底不计费。
+	low := strings.ToLower(strings.TrimSpace(model))
+	if mapped, ok := upstreamDisplayNameAliases[low]; ok && mapped != "" {
+		return mapped
+	}
+	// 4b. 显示名别名表的模糊兜底：客户端常省略 "-preview"/"-flash" 后缀
+	// （"qwen4-max"、"kimi-k3.1-pro"）。只在别名表内匹配，且要求归一化后
+	// 相等或互为前缀，避免 "qwen4-max" 误命中 "qwen3.8-max"。
+	if mapped := lookupDisplayAlias(low); mapped != "" {
+		return mapped
+	}
+
+	// 5. 大小写归一化兜底（客户端直接传 Qoder key，如 "dmodel" / "Performance"）
+	return low
+}
+
+// lookupDisplayAlias 在显示名别名表内做归一化前缀匹配。
+//
+// 归一化：去掉 "-" / "_" / 空格，并把 "preview" 视作可省略后缀。
+// 例："qwen4-max" ≈ "qwen4max" 命中 "qwen4-max-preview" ≈ "qwen4max"；
+// 但 "qwen4-max" 不会命中 "qwen3.8-max"（数字不同）。
+//
+// 只在「候选唯一」时返回——多个别名同时命中说明有歧义，宁可让上游兜底
+// 也不要猜错模型（猜错会消耗别的模型额度）。
+func lookupDisplayAlias(low string) string {
+	norm := func(s string) string {
+		s = strings.ToLower(s)
+		s = strings.ReplaceAll(s, "-", "")
+		s = strings.ReplaceAll(s, "_", "")
+		s = strings.ReplaceAll(s, " ", "")
+		return s
+	}
+	want := norm(low)
+	if want == "" {
+		return ""
+	}
+	var hit string
+	for alias, key := range upstreamDisplayNameAliases {
+		if norm(alias) == want {
+			if hit != "" && hit != key {
+				return "" // 歧义：放弃模糊匹配
+			}
+			hit = key
+		}
+	}
+	return hit
+}
+
+// upstreamDisplayNameAliases 把上游「显示名」映射回 model.key。
+//
+// 为什么需要：很多客户端（以及用户在控制台手工填模型名时）用的是界面上看到的
+// 显示名（如 "Qwen4-Max-Preview"），而不是上游内部 key（"qmodel_latest"）。
+// MapModel 此前只认 Claude / GPT / Gemini 家族关键字，其余一律 ToLower 后
+// 原样发给上游——而**上游对未知 key 会走兜底返回内容、但不把这次调用计入
+// quota**（见 CallQoderWithOpts 开头注释）。表现就是 issue #13 的
+// 「请求成功但 dashboard 无用量」，且这类请求没有真实配额支撑，更容易撞排队/429。
+//
+// 取值来自 /algo/api/v2/model/list 的 display_name（2026-11-14 实拉，两区并集）。
+// 新增模型时同步补一行；显示名会随上游改版变化，过期条目由
+// lookupDisplayAlias 的归一化匹配消化，不会误伤合法 key（合法 key 在小写后
+// 原样返回，别名表只影响原本会被当作未知 key 发出的名字）。
+var upstreamDisplayNameAliases = map[string]string{
+	// Qwen
+	"qwen4-max-preview":   "qmodel_latest",
+	"qwen4 max preview":   "qmodel_latest",
+	"qwen4-max":           "qmodel_latest",
+	"qwen4max":            "qmodel_latest",
+	"qwen3.8-max":         "qmodel_38max",
+	"qwen3.8 max":         "qmodel_38max",
+	"qwen3.8-max-preview": "qmodel_38max",
+	"qwen3.8-flash":       "qfmodel",
+	"qwen3.8 flash":       "qfmodel",
+	"qwen3.7-plus":        "qmodel", // 已下线，保留仅避免老配置报错
+	"qwen3.7-flash":       "q37fmodel",
+	// Step
+	"step-5-preview": "jmodel",
+	"step-5":         "jmodel",
+	"step5":          "jmodel",
+	"step 5 preview": "jmodel",
+	// DeepSeek
+	"deepseek-v4-pro": "dmodel",
+	"deepseek v4 pro": "dmodel",
+	"deepseek-flash":  "dfmodel",
+	"deepseek flash":  "dfmodel",
+	// GLM
+	"glm-5.3":       "gmodel",
+	"glm-5.3-flash": "gfmodel",
+	"glm-5.3 flash": "gfmodel",
+	"glm-5.2":       "gm51model",
+	// Kimi
+	"kimi-k3.1-pro":     "kmodel_latest",
+	"kimi k3.1 pro":     "kmodel_latest",
+	"kimi-k2.8-preview": "kmodel",
+	"kimi k2.8 preview": "kmodel",
+	// MiniMax
+	"minimax-m3.1-flash": "mmodel",
+	"minimax m3.1 flash": "mmodel",
+	// 国际版档位 / 代号模型
+	"ultimate":  "ultimate",
+	"efficient": "efficient",
+	"sonus":     "smodel",
+	"cantus":    "cmodel",
+	"fast":      "fast",
+}
+
+// knownUpstreamKeys 是从未变的上游合法 key 集合（两区并集，2026-11-14 实拉）。
+//
+// 用途只有一个：当 MapModel 最终产出的 key 不在其中时打 WARN——这是
+// issue #13「调用成功却不扣额度」的早期信号（未知 key → 上游兜底、不计费）。
+// 不阻断请求：上游随时可能新增 key，硬拒会把新模型挡在门外。
+var knownUpstreamKeys = map[string]struct{}{
+	"auto": {}, "ultimate": {}, "efficient": {}, "fast": {},
+	"qmodel_latest": {}, "qmodel_38max": {}, "qfmodel": {},
+	"jmodel": {}, "dmodel": {}, "dfmodel": {},
+	"gmodel": {}, "gfmodel": {}, "smodel": {}, "cmodel": {},
+	"kmodel_latest": {}, "kmodel": {}, "mmodel": {},
+}
+
+// IsKnownUpstreamKey 报告 key 是否为已知的上游合法 key。
+func IsKnownUpstreamKey(key string) bool {
+	_, ok := knownUpstreamKeys[strings.ToLower(key)]
+	return ok
 }
 
 // lookupMapping 在单张映射表内执行：精确匹配 → 长度倒序 + 双向 substring 模糊匹配。

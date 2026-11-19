@@ -49,6 +49,32 @@
       padding: 16px;
     }
     .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    /* 表格单元格里的按钮组：绝不能用 .row（display:flex 会让 td 脱离表格
+       布局，列宽/行高整体错位）。这里用 inline-flex 包一层 action-wrap，
+       作用域只在单元格内部。 */
+    .action-cell { white-space: nowrap; }
+    .action-wrap { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .action-wrap button { padding: 6px 10px; font-size: 13px; }
+    /* 冷却/错误原因：长中文句子必须能断行，否则会把整个表格列撑到屏幕外 */
+    .slot-note {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 4px;
+      max-width: 320px;
+      white-space: normal;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      line-height: 1.4;
+    }
+    /* 账号徽标行：允许换行，避免多个徽标把列顶宽 */
+    .slot-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 4px;
+      max-width: 100%;
+    }
+    .slot-badges .pill { white-space: nowrap; }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -116,6 +142,14 @@
     }
     @media (max-width: 860px) {
       .grid-2 { grid-template-columns: 1fr; }
+    }
+    /* 窄屏：操作列 6 个按钮挤不下，改为纵向堆叠（仍保持表格布局，
+       不能用 display:flex——那会让 td 脱离列宽分配、整表错位）。 */
+    @media (max-width: 900px) {
+      .action-wrap { flex-direction: column; align-items: stretch; }
+      .action-wrap button { width: 100%; }
+      #accountTable { table-layout: auto; }
+      .slot-note { max-width: 100%; }
     }
     label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
     input, select { width: 100%; }
@@ -281,7 +315,7 @@
       <div id="checkinResult" style="margin-bottom:12px; display:none">
         <pre id="checkinBox"></pre>
       </div>
-      <table>
+      <table id="accountTable">
         <thead>
           <tr>
             <th>账号</th>
@@ -662,8 +696,19 @@
 
     function fmtDur(ms) {
       const sec = Math.max(0, Math.ceil(ms / 1000));
-      const m = Math.floor(sec / 60), r = sec % 60;
-      return m > 0 ? m + 'm' + String(r).padStart(2, '0') + 's' : r + 's';
+      return fmtSec(sec);
+    }
+
+    // fmtSec 把秒数格式化为紧凑可读时长（974s -> 16m14s，3700s -> 1h01m）。
+    // 后端 breaker_for / degrade_for 给的是秒，直接拼 "s" 会出现 "熔断 974s"
+    // 这种既难读、又会把徽标撑宽的长数字。
+    function fmtSec(sec) {
+      sec = Math.max(0, Math.ceil(sec));
+      if (sec < 60) return sec + 's';
+      const m = Math.floor(sec / 60), s = sec % 60;
+      if (m < 60) return m + 'm' + String(s).padStart(2, '0') + 's';
+      const h = Math.floor(m / 60), mm = m % 60;
+      return h + 'h' + String(mm).padStart(2, '0') + 'm';
     }
 
     function fmtNum(n) {
@@ -783,19 +828,30 @@
         let slotBadges = '';
         if (slot) {
           if (slot.breaker_for > 0) {
-            slotBadges += `<span class="pill" style="border-color:#f0c2c6;background:#fff5f5;color:#cf222e">熔断 ${slot.breaker_for}s</span>`;
+            slotBadges += `<span class="pill" style="border-color:#f0c2c6;background:#fff5f5;color:#cf222e" title="熔断中，${fmtSec(slot.breaker_for)} 后重试">熔断 ${fmtSec(slot.breaker_for)}</span>`;
           }
           if (slot.degrade_for > 0) {
-            slotBadges += `<span class="pill" style="border-color:#e6b800;background:#fff8e1;color:#8a6d00">降权 ${slot.degrade_for}s</span>`;
+            slotBadges += `<span class="pill" style="border-color:#e6b800;background:#fff8e1;color:#8a6d00" title="降权中，${fmtSec(slot.degrade_for)} 后恢复">降权 ${fmtSec(slot.degrade_for)}</span>`;
           }
           const modelCds = slot.model_cooldowns || {};
           const modelKeys = Object.keys(modelCds);
           if (modelKeys.length) {
-            slotBadges += `<span class="pill" style="border-color:#e6b800;background:#fff8e1;color:#8a6d00">模型冷却 ${modelKeys.length}</span>`;
+            // model_cooldowns 是「剩余毫秒」（模型 key → ms），列出具体模型
+            // 与剩余时长（最多 3 个），便于判断是哪个模型在冷却。
+            const items = modelKeys.slice(0, 3).map(mk => {
+              const ms = Number(modelCds[mk]) || 0;
+              return ms > 0 ? `${mk} ${fmtDur(ms)}` : mk;
+            });
+            const more = modelKeys.length > 3 ? ` +${modelKeys.length - 3}` : '';
+            slotBadges += `<span class="pill" style="border-color:#e6b800;background:#fff8e1;color:#8a6d00" title="${modelKeys.map(k => k + ' ' + fmtDur(Number(modelCds[k]) || 0)).join(', ')}">模型冷却 ${items.join(' / ')}${more}</span>`;
           }
         }
-        const poolNote = (slot && coolMs > 0 && slot.last_error)
-          ? `<div class="muted" style="font-size:11px">${slot.last_error}</div>` : '';
+        // 账号级冷却或模型级冷却时都要显示原因：只看 coolMs 会漏掉
+        // 「账号可用但某几个模型在冷却」的情况（那时 coolMs=0）。
+        const hasModelCool = slot && Object.keys(slot.model_cooldowns || {}).length > 0;
+        const showNote = slot && slot.last_error && (coolMs > 0 || hasModelCool || slot.breaker_for > 0 || slot.degrade_for > 0);
+        const poolNote = showNote
+          ? `<div class="slot-note" title="${(slot.last_error || '').replace(/"/g, '&quot;')}">${slot.last_error}</div>` : '';
         // 出口代理徽标：只显示 host，不显示凭据（密码不进控制台）。
         const proxyBadge = a.proxy
           ? `<span class="pill" title="账号绑定的出口代理">出口 ${a.proxy.replace(/\/\/[^@]*@/, '//***@')}</span>`
@@ -809,7 +865,7 @@
           <td>
             <div><strong>${a.name || a.id}</strong> ${a.active ? '<span class="pill">启用</span>' : ''} ${poolBadge} ${reauthBadge}</div>
             <div class="muted">${a.email || '-'}</div>
-            ${slotBadges ? `<div class="row" style="gap:4px; margin-top:4px">${slotBadges}</div>` : ''}
+            ${slotBadges ? `<div class="slot-badges">${slotBadges}</div>` : ''}
             ${proxyBadge ? `<div style="margin-top:4px">${proxyBadge}</div>` : ''}
             ${poolNote}
           </td>
@@ -819,13 +875,15 @@
           </td>
           <td class="quota-cell" data-quota-id="${a.id}">${renderQuota(cachedQuota)}</td>
           <td data-refresh-id="${a.id}">${renderRefreshCell(a.id)}</td>
-          <td class="row">
-            <button class="secondary" data-act="activate" data-id="${a.id}" ${a.active ? 'disabled' : ''}>启用</button>
-            <button class="secondary" data-act="quota" data-id="${a.id}">刷新额度</button>
-            <button class="secondary" data-act="checkin" data-id="${a.id}">🎁 签到</button>
-            <button class="secondary" data-act="cool" data-id="${a.id}">冷却</button>
-            <button class="secondary" data-act="proxy" data-id="${a.id}">出口代理</button>
-            <button class="danger" data-act="delete" data-id="${a.id}">删除</button>
+          <td class="action-cell">
+            <div class="action-wrap">
+              <button class="secondary" data-act="activate" data-id="${a.id}" ${a.active ? 'disabled' : ''}>启用</button>
+              <button class="secondary" data-act="quota" data-id="${a.id}">刷新额度</button>
+              <button class="secondary" data-act="checkin" data-id="${a.id}">🎁 签到</button>
+              <button class="secondary" data-act="cool" data-id="${a.id}">冷却</button>
+              <button class="secondary" data-act="proxy" data-id="${a.id}">出口代理</button>
+              <button class="danger" data-act="delete" data-id="${a.id}">删除</button>
+            </div>
           </td>
         </tr>
       `};
