@@ -269,6 +269,10 @@ func (b *Bridge) ListAvailableModels() ([]QoderModel, error) {
 		}
 		models, err := b.listModelsFromSlot(slot)
 		if err == nil {
+			// 顺手用实时清单刷新别名表（display_name → key）。
+			// 这里是「不需要人工维护别名表」的关键：只要有一次成功拉取，
+			// 上游当前的全部显示名就都认识。
+			RegisterModelCatalog(models)
 			return models, nil
 		}
 		lastErr = err
@@ -327,6 +331,24 @@ func (b *Bridge) listModelsFromSlot(slot *Slot) ([]QoderModel, error) {
 		return nil, fmt.Errorf("%s -> empty model list, keys=%v", modelListURLs[0], keys)
 	}
 	return models, nil
+}
+
+// RawModelList 返回上游 model/list 的**原始响应**（不经过 parseQoderModels
+// 的 assistant/developer/chat 优先级筛选）。
+//
+// 用途：排查「某个 key 到底有没有下发」。parseQoderModels 只取第一个非空分类，
+// 若上游把新模型放在别的分类下（如 qcode / quest），解析结果里就看不到它——
+// 排查时必须看全量原始响应才能确认。
+func (b *Bridge) RawModelList() (map[string]interface{}, error) {
+	slot, ok := b.pickSlotInRegion(nil)
+	if !ok {
+		return nil, ErrNoAccount
+	}
+	urls := b.modelListURLs(slot.Region)
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("no model list endpoint for region %s", slot.Region)
+	}
+	return slot.client.callGetCandidates("model_list", urls)
 }
 
 // modelListURLs 返回该区域的模型目录端点候选（测试注入时覆盖）。
@@ -545,6 +567,9 @@ func (b *Bridge) modelCatalog() []QoderModel {
 	}
 	b.catalogCache = models
 	b.catalogCacheAt = time.Now()
+	// 上游清单是显示名的**唯一权威来源**：拉到就立即刷新别名表，
+	// 上游新增模型 / 改显示名后无需改代码、无需重启即可生效。
+	RegisterModelCatalog(models)
 	return models
 }
 
@@ -1101,15 +1126,17 @@ func MapModel(agent, model string) string {
 		return mapped
 	}
 
-	// 4. 上游显示名 → key（"Qwen4-Max-Preview" → qmodel_latest）。
+	// 4. 上游显示名 → key。**优先用运行时别名表**（来自实时清单，随上游
+	// 自动更新），静态种子表只在还没拉到过清单时兜底。
 	// 必须在 ToLower 之前：否则显示名会被原样小写发给上游，落到兜底不计费。
+	if mapped := lookupRuntimeAlias(model); mapped != "" {
+		return mapped
+	}
 	low := strings.ToLower(strings.TrimSpace(model))
 	if mapped, ok := upstreamDisplayNameAliases[low]; ok && mapped != "" {
 		return mapped
 	}
-	// 4b. 显示名别名表的模糊兜底：客户端常省略 "-preview"/"-flash" 后缀
-	// （"qwen4-max"、"kimi-k3.1-pro"）。只在别名表内匹配，且要求归一化后
-	// 相等或互为前缀，避免 "qwen4-max" 误命中 "qwen3.8-max"。
+	// 4b. 静态种子表的归一化匹配（省略 "-preview"/"-flash" 后缀等写法）
 	if mapped := lookupDisplayAlias(low); mapped != "" {
 		return mapped
 	}
@@ -1159,24 +1186,23 @@ func lookupDisplayAlias(low string) string {
 // quota**（见 CallQoderWithOpts 开头注释）。表现就是 issue #13 的
 // 「请求成功但 dashboard 无用量」，且这类请求没有真实配额支撑，更容易撞排队/429。
 //
-// 取值来自 /algo/api/v2/model/list 的 display_name（2026-11-14 实拉，两区并集）。
+// 取值来自 /algo/api/v2/model/list 的 display_name（2026-11-19 实拉，两区并集）。
 // 新增模型时同步补一行；显示名会随上游改版变化，过期条目由
 // lookupDisplayAlias 的归一化匹配消化，不会误伤合法 key（合法 key 在小写后
 // 原样返回，别名表只影响原本会被当作未知 key 发出的名字）。
 var upstreamDisplayNameAliases = map[string]string{
-	// Qwen
+	// Qwen（2026-11-19 起上游把 Qwen4-Max-Preview 的显示名改成了 "Qwen4-Max"，
+	// 旧名保留一段时间的兼容）
+	"qwen4-max":           "qmodel_latest",
 	"qwen4-max-preview":   "qmodel_latest",
 	"qwen4 max preview":   "qmodel_latest",
-	"qwen4-max":           "qmodel_latest",
 	"qwen4max":            "qmodel_latest",
 	"qwen3.8-max":         "qmodel_38max",
 	"qwen3.8 max":         "qmodel_38max",
 	"qwen3.8-max-preview": "qmodel_38max",
 	"qwen3.8-flash":       "qfmodel",
 	"qwen3.8 flash":       "qfmodel",
-	"qwen3.7-plus":        "qmodel", // 已下线，保留仅避免老配置报错
-	"qwen3.7-flash":       "q37fmodel",
-	// Step
+	// Step（2026-11-19 实拉：CN 有 jmodel，Global 没有）
 	"step-5-preview": "jmodel",
 	"step-5":         "jmodel",
 	"step5":          "jmodel",
@@ -1187,10 +1213,11 @@ var upstreamDisplayNameAliases = map[string]string{
 	"deepseek-flash":  "dfmodel",
 	"deepseek flash":  "dfmodel",
 	// GLM
+	"glm-5.4":       "gmodel_latest",
+	"glm 5.4":       "gmodel_latest",
 	"glm-5.3":       "gmodel",
 	"glm-5.3-flash": "gfmodel",
 	"glm-5.3 flash": "gfmodel",
-	"glm-5.2":       "gm51model",
 	// Kimi
 	"kimi-k3.1-pro":     "kmodel_latest",
 	"kimi k3.1 pro":     "kmodel_latest",
@@ -1199,30 +1226,36 @@ var upstreamDisplayNameAliases = map[string]string{
 	// MiniMax
 	"minimax-m3.1-flash": "mmodel",
 	"minimax m3.1 flash": "mmodel",
-	// 国际版档位 / 代号模型
-	"ultimate":  "ultimate",
-	"efficient": "efficient",
-	"sonus":     "smodel",
-	"cantus":    "cmodel",
-	"fast":      "fast",
+	// 国际版档位（2026-11-19 实拉：qwake 分类里另有 performance，但
+	// assistant/chat 未下发，故不进种子表；运行时表会按实际下发自动补充）
+	"ultimate":    "ultimate",
+	"efficient":   "efficient",
+	"performance": "performance",
 }
 
-// knownUpstreamKeys 是从未变的上游合法 key 集合（两区并集，2026-11-14 实拉）。
+// knownUpstreamKeys 是已知的上游合法 key 集合（两区并集，2026-11-19 实拉）。
 //
 // 用途只有一个：当 MapModel 最终产出的 key 不在其中时打 WARN——这是
 // issue #13「调用成功却不扣额度」的早期信号（未知 key → 上游兜底、不计费）。
 // 不阻断请求：上游随时可能新增 key，硬拒会把新模型挡在门外。
 var knownUpstreamKeys = map[string]struct{}{
-	"auto": {}, "ultimate": {}, "efficient": {}, "fast": {},
+	"auto": {}, "ultimate": {}, "efficient": {}, "performance": {},
 	"qmodel_latest": {}, "qmodel_38max": {}, "qfmodel": {},
 	"jmodel": {}, "dmodel": {}, "dfmodel": {},
-	"gmodel": {}, "gfmodel": {}, "smodel": {}, "cmodel": {},
+	"gmodel": {}, "gmodel_latest": {}, "gfmodel": {},
 	"kmodel_latest": {}, "kmodel": {}, "mmodel": {},
 }
 
 // IsKnownUpstreamKey 报告 key 是否为已知的上游合法 key。
+//
+// 先查运行时表（来自最近一次实时清单，最权威），再落到静态种子集合。
+// 两者都没有才判为未知——那说明客户端传了一个上游确实不认识的 key，
+// 请求会被兜底处理且不计费（issue #13）。
 func IsKnownUpstreamKey(key string) bool {
-	_, ok := knownUpstreamKeys[strings.ToLower(key)]
+	if isRuntimeKnownKey(key) {
+		return true
+	}
+	_, ok := knownUpstreamKeys[strings.ToLower(strings.TrimSpace(key))]
 	return ok
 }
 

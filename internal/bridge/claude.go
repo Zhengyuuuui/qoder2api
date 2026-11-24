@@ -354,11 +354,14 @@ func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 		data = append(data, entry)
 	}
 	if len(data) == 0 {
-		// 兜底清单：上游 model/list 拉取失败时用（快照 2026-11-13）。
-		// 只列国内版实测存在的 key；国际版独占档（ultimate / efficient /
-		// smodel / cmodel / fast）不在此列——拉不到清单时暴露它们会让客户端
-		// 反复撞「模型不存在」。
-		for _, key := range []string{"auto", "qmodel_latest", "qmodel_38max", "qfmodel", "dmodel", "dfmodel", "gmodel", "gfmodel", "jmodel", "kmodel_latest", "kmodel", "mmodel"} {
+		// 兜底清单：仅在上游 model/list 拉取失败（凭据全失效 / 网络不通）时使用。
+		// 内容严格等于 2026-11-19 两区实测下发的并集，**不含任何已下线 key**
+		// （qmodel / q37fmodel / gm51model / smodel / cmodel / fast 已全部移除）。
+		//
+		// 为什么删干净而不是「宁多勿少」：失效 key 会让客户端选中一个上游
+		// 不认识的模型，请求走兜底返回但不计 quota，用户只会看到「没用量 /
+		// 一直排队」，比少一个选项更难排查（issue #13）。
+		for _, key := range []string{"auto", "ultimate", "efficient", "qmodel_latest", "qmodel_38max", "qfmodel", "dmodel", "dfmodel", "gmodel", "gmodel_latest", "gfmodel", "jmodel", "kmodel_latest", "kmodel", "mmodel"} {
 			data = append(data, map[string]interface{}{
 				"id":             key,
 				"object":         "model",

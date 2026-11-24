@@ -32,11 +32,12 @@ type LogPage struct {
 }
 
 var (
-	mu           sync.RWMutex
-	entries      []Entry
-	nextSeq      = 1
-	maxEntries   = 2000
-	currentLevel = LevelInfo
+	mu            sync.RWMutex
+	entries       []Entry
+	nextSeq       = 1
+	maxEntries    = 2000
+	currentLevel  = LevelInfo
+	silenceStdout bool
 
 	// 文件 sink 状态
 	fileMu     sync.Mutex
@@ -187,6 +188,17 @@ func SetLevel(level string) {
 	currentLevel = Level(level)
 }
 
+// SilenceStdout 关闭 stdout sink（只保留内存环 + 文件 sink）。
+//
+// 供 CLI 工具使用：lib 里的日志会直接打到 stdout，把结构化的 JSON 输出
+// 污染掉（`modellist -json | jq` 会解析失败）。工具在需要纯净 stdout 时
+// 调用本函数；进程级设置，调用一次即生效。
+func SilenceStdout() {
+	mu.Lock()
+	defer mu.Unlock()
+	silenceStdout = true
+}
+
 func shouldLog(level Level) bool {
 	mu.RLock()
 	defer mu.RUnlock()
@@ -215,9 +227,14 @@ func log(level Level, format string, args ...interface{}) {
 	}
 	mu.Unlock()
 
-	// sink 2: stdout（dev 模式 / 终端启动时可见）
+	// sink 2: stdout（dev 模式 / 终端启动时可见；CLI 工具可 SilenceStdout 关闭）
 	line := fmt.Sprintf("[%s][%s] %s", entry.Time.Format("15:04:05.000"), level, entry.Message)
-	fmt.Println(line)
+	mu.RLock()
+	silent := silenceStdout
+	mu.RUnlock()
+	if !silent {
+		fmt.Println(line)
+	}
 
 	// sink 3: 文件（GUI 启动时事后翻日志的唯一入口）
 	fileMu.Lock()

@@ -19,7 +19,8 @@ func TestMapModelDisplayNameAliases(t *testing.T) {
 
 	cases := []struct{ in, want string }{
 		// 上游显示名 → key
-		{"Qwen4-Max-Preview", "qmodel_latest"},
+		{"Qwen4-Max-Preview", "qmodel_latest"}, // 旧显示名（2026-11-19 前）
+		{"Qwen4-Max", "qmodel_latest"},         // 新显示名
 		{"qwen4-max-preview", "qmodel_latest"},
 		{"Step-5-Preview", "jmodel"},
 		{"Qwen3.8-Max", "qmodel_38max"},
@@ -27,12 +28,12 @@ func TestMapModelDisplayNameAliases(t *testing.T) {
 		{"DeepSeek-V4-Pro", "dmodel"},
 		{"DeepSeek-Flash", "dfmodel"},
 		{"GLM-5.3", "gmodel"},
+		{"GLM-5.4", "gmodel_latest"},
+		{"glm-5.4", "gmodel_latest"},
 		{"GLM-5.3-Flash", "gfmodel"},
 		{"Kimi-K3.1-Pro", "kmodel_latest"},
 		{"Kimi-K2.8-Preview", "kmodel"},
 		{"MiniMax-M3.1-Flash", "mmodel"},
-		{"Sonus", "smodel"},
-		{"Cantus", "cmodel"},
 		// 省略后缀 / 去分隔符的常见写法
 		{"qwen4-max", "qmodel_latest"},
 		{"qwen4max", "qmodel_latest"},
@@ -117,9 +118,65 @@ func TestIsKnownUpstreamKey(t *testing.T) {
 			t.Errorf("%q should be a known key", k)
 		}
 	}
-	for _, k := range []string{"qwen4-max-preview", "nonexistent", "claude-sonnet-4-6"} {
+	for _, k := range []string{"qwen4-max-preview", "nonexistent", "claude-sonnet-4-6",
+		// 2026-11-19 起上游不再下发，已从合法 key 集合移除
+		"smodel", "cmodel", "fast", "qmodel", "q37fmodel", "gm51model"} {
 		if IsKnownUpstreamKey(k) {
-			t.Errorf("%q should NOT be a known key", k)
+			t.Errorf("%q should NOT be a known key (retired upstream)", k)
+		}
+	}
+}
+
+// TestRuntimeAliasAutoRegistration 验证「上游新增模型后无需改代码」：
+// 只要 RegisterModelCatalog 喂进来一个新模型，它的显示名立刻就能命中，
+// 且该 key 立刻被认定为合法 key。
+//
+// 这是「不靠猜」的核心：上游 model/list 的 display_name 是唯一权威来源，
+// 每次成功拉取都会调用 RegisterModelCatalog，别名表随之自动更新。
+func TestRuntimeAliasAutoRegistration(t *testing.T) {
+	account.SetDataRoot(t.TempDir())
+
+	// 一个此前从未出现过的模型（模拟上游将来新增的 "hungerg"）
+	const newKey = "hgm_2026x"
+	const newName = "HungerG-Preview"
+	if IsKnownUpstreamKey(newKey) {
+		t.Fatal("precondition: new key should be unknown before registration")
+	}
+	if got := MapModel("codex", newName); got == newKey {
+		t.Fatal("precondition: display name should not map before registration")
+	}
+
+	RegisterModelCatalog([]QoderModel{{Key: newKey, DisplayName: newName}})
+
+	// 注册后：显示名 → key、省略后缀也能命中、key 本身被认定合法
+	for _, in := range []string{newName, "hungerg-preview", "HungerG-Preview", "hungerg preview"} {
+		if got := MapModel("codex", in); got != newKey {
+			t.Errorf("MapModel(%q) = %q, want %q after registration", in, got, newKey)
+		}
+	}
+	if !IsKnownUpstreamKey(newKey) {
+		t.Error("registered key should be known")
+	}
+}
+
+// TestRuntimeAliasDoesNotBreakRealKeys 验证运行时别名表不会改写合法 key。
+func TestRuntimeAliasDoesNotBreakRealKeys(t *testing.T) {
+	account.SetDataRoot(t.TempDir())
+	RegisterModelCatalog([]QoderModel{
+		{Key: "auto", DisplayName: "Auto"},
+		{Key: "gmodel_latest", DisplayName: "GLM-5.4"},
+		{Key: "gmodel", DisplayName: "GLM-5.3"},
+	})
+	cases := map[string]string{
+		"auto":          "auto",
+		"gmodel":        "gmodel",
+		"gmodel_latest": "gmodel_latest",
+		"GLM-5.4":       "gmodel_latest",
+		"GLM-5.3":       "gmodel",
+	}
+	for in, want := range cases {
+		if got := MapModel("codex", in); got != want {
+			t.Errorf("MapModel(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
